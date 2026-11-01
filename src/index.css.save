@@ -1,0 +1,6 @@
+@import "tailwindcss";
+@theme { --color-ink:#14213d; --color-brand:#0f6b4f; --color-brand-dark:#0a4d39; --color-paper:#f7f8f5; --color-gold:#e0a526; --font-display:'Fraunces',serif; --font-sans:'Inter',system-ui,sans-serif; }
+body{font-family:var(--font-sans);background:var(--color-paper);color:var(--color-ink)}
+.btn-primary{@apply inline-flex items-center justify-center rounded-lg px-5 py-2.5 font-medium transition focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-brand disabled:opacity-50 bg-brand text-white hover:bg-brand-dark}
+.btn-ghost{@apply inline-flex items-center justify-center rounded-lg px-5 py-2.5 font-medium transition focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-brand disabled:opacity-50 border border-ink/20 hover:bg-ink/5}
+.input{@apply w-full rounded-lg border border-ink/20 bg-white px-3 py-2.5 focus:border-brand focus:outline-none}

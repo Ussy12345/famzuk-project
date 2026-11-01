@@ -1,0 +1,29 @@
+create extension if not exists "pgcrypto";
+create table profiles(id uuid primary key references auth.users on delete cascade, full_name text, is_admin boolean default false, created_at timestamptz default now());
+create table course_profiles(id uuid primary key default gen_random_uuid(), name text unique not null, description text, project_types text[] default '{}', methodologies text[] default '{}', terminology text[] default '{}', interview_templates jsonb default '[]', research_requirements text, created_at timestamptz default now());
+create table chapter_templates(id uuid primary key default gen_random_uuid(), course_id uuid references course_profiles on delete cascade, project_type text, structure jsonb not null, created_at timestamptz default now());
+create table projects(id uuid primary key default gen_random_uuid(), user_id uuid not null references auth.users on delete cascade, course_id uuid references course_profiles, course_name text, level text, institution text, topic text not null, project_type text, target_pages int, style text default 'simple_english', status text default 'draft' check(status in('draft','interview','ready','generating','review','completed','failed')), created_at timestamptz default now(), updated_at timestamptz default now());
+create table project_questions(id uuid primary key default gen_random_uuid(), project_id uuid references projects on delete cascade, position int, question text not null, answer text, created_at timestamptz default now());
+create table project_memory(project_id uuid primary key references projects on delete cascade, data jsonb not null default '{}', updated_at timestamptz default now());
+create table project_chapters(id uuid primary key default gen_random_uuid(), project_id uuid references projects on delete cascade, position int, title text, status text default 'pending');
+create table project_sections(id uuid primary key default gen_random_uuid(), chapter_id uuid references project_chapters on delete cascade, project_id uuid references projects on delete cascade, position int, heading text, content text default '', status text default 'pending' check(status in('pending','generating','completed','failed')), user_edited boolean default false, updated_at timestamptz default now());
+create table project_sources(id uuid primary key default gen_random_uuid(), project_id uuid references projects on delete cascade, citation text not null, provenance text default 'student_provided' check(provenance in('student_provided','ai_generated','verified','needs_verification')), created_at timestamptz default now());
+create table project_generation_jobs(id uuid primary key default gen_random_uuid(), project_id uuid references projects on delete cascade, chapter_id uuid, section_id uuid references project_sections on delete cascade, status text default 'pending', attempts int default 0, error text, run_after timestamptz default now(), started_at timestamptz, completed_at timestamptz);
+create index on projects(user_id); create index on project_sections(project_id,position); create index on project_generation_jobs(status,run_after);
+alter table profiles enable row level security; alter table course_profiles enable row level security; alter table chapter_templates enable row level security;
+alter table projects enable row level security; alter table project_questions enable row level security; alter table project_memory enable row level security;
+alter table project_chapters enable row level security; alter table project_sections enable row level security; alter table project_sources enable row level security; alter table project_generation_jobs enable row level security;
+create policy own_profile on profiles for all using(id=auth.uid()) with check(id=auth.uid());
+create policy read_courses on course_profiles for select using(true);
+create policy read_templates on chapter_templates for select using(true);
+create policy own_projects on projects for all using(user_id=auth.uid()) with check(user_id=auth.uid());
+do $$ declare t text; begin foreach t in array array['project_questions','project_memory','project_chapters','project_sections','project_sources','project_generation_jobs'] loop
+execute format('create policy own_%1$s on %1$s for all using(exists(select 1 from projects p where p.id=%1$s.project_id and p.user_id=auth.uid())) with check(exists(select 1 from projects p where p.id=%1$s.project_id and p.user_id=auth.uid()))',t); end loop; end $$;
+create function handle_new_user() returns trigger language plpgsql security definer as $$ begin insert into profiles(id,full_name) values(new.id,new.raw_user_meta_data->>'full_name'); return new; end $$;
+create trigger on_auth_user_created after insert on auth.users for each row execute function handle_new_user();
+insert into course_profiles(name,description,project_types,methodologies,interview_templates) values
+('Computer Science','Software, systems and computing research',array['System Development Project','Research Project'],array['Agile','Waterfall','Prototyping'],'["What problem is the project solving?","Who are the main users?","What major features should it have?"]'),
+('Accounting','Financial reporting and auditing research',array['Research Project'],array['Survey','Case study'],'["Which organisations or period will you study?","What data will you collect?"]'),
+('Biochemistry','Laboratory and experimental research',array['Research Project'],array['Experimental design'],'["What samples or experiments are involved?","Which techniques will you use?"]'),
+('Economics',null,array['Research Project'],array['Regression analysis'],'[]'),('Mass Communication',null,array['Research Project'],array['Survey','Content analysis'],'[]'),
+('Business Administration',null,array['Research Project'],array['Survey'],'[]'),('Microbiology',null,array['Research Project'],array['Experimental design'],'[]'),('Education',null,array['Research Project'],array['Survey'],'[]');
