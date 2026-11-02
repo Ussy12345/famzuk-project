@@ -78,6 +78,37 @@ function parseRefs(text: string): string[] {
   return text.split('\n').map(l => l.replace(/^\s*(\d+[.)]|[-•*])\s*/, '').trim()).filter(l => l.length > 40 && /\(20(2[0-5])\)/.test(l) && /https?:\/\//.test(l))
 }
 
+const CITE_STRICT = `CITATION RULES: every paragraph MUST end with one or two in-text citations taken only from the SOURCES list, written (Surname, Year) for one author, (Surname & Surname, Year) for two, and (Surname et al., Year) for three or more. Cite a source ONLY for a statement its abstract supports. If no source supports a statement, leave that statement out. Never cite anything that is not in the list.`
+const CITE_LOOSE = `CITATION RULES: cite from the SOURCES list only where a statement is supported by that source's abstract, using (Surname, Year), (Surname & Surname, Year) or (Surname et al., Year). Never cite anything not in the list.`
+
+function pickRefs(src: any[], q: string, n: number) {
+  const words = q.toLowerCase().split(/\W+/).filter(w => w.length > 3)
+  return src.map(x => ({ x, sc: words.reduce((a, w) => a + ((x.citation + ' ' + (x.abstract ?? '')).toLowerCase().includes(w) ? 1 : 0), 0) })).sort((a, b) => b.sc - a.sc).slice(0, n).map(o => o.x)
+}
+function fixCitations(text: string, refs: any[]) {
+  const allowed = refs.map(r => ({ sur: String(r.citation).split(',')[0].trim().toLowerCase(), yr: String(r.citation).match(/\((\d{4})[a-z]?\)/)?.[1] }))
+  const valid = (c: string) => { const y = c.match(/(\d{4})/)?.[1]; const first = c.split(/[,&]| et al/)[0].trim().toLowerCase(); return allowed.some(a => a.yr === y && a.sur === first) }
+  let bad = 0
+  const out = text.replace(/\(([A-Z][^()]*?\d{4}[a-z]?)\)/g, (m, inner: string) => {
+    const parts = inner.split(';').map(x => x.trim()); const good = parts.filter(valid)
+    if (good.length === parts.length) return m
+    bad += parts.length - good.length
+    return good.length ? `(${good.join('; ')})` : ''
+  })
+  return { text: out.replace(/ +\./g, '.').replace(/ {2,}/g, ' '), ok: bad === 0 }
+}
+function checkText(t: string, refs: any[], strict: boolean) {
+  const f = fixCitations(t, refs)
+  const missing = strict ? f.text.split(/\n\n+/).filter(p => p.trim().length > 60 && !/\([A-Z][^()]*\d{4}[a-z]?\)[.]?$/.test(p.trim())).length : 0
+  return { text: f.text, ok: f.ok, missing }
+}
+function abstractOf(w: any): string {
+  const ix = w.abstract_inverted_index; if (!ix) return ''
+  const words: string[] = []
+  for (const [word, pos] of Object.entries(ix as Record<string, number[]>)) for (const p of pos) words[p] = word
+  return words.filter(Boolean).join(' ').slice(0, 1200)
+}
+
 function apaName(n: string) { const p = n.replace(/\./g, '').trim().split(/\s+/); if (p.length < 2) return n; return `${p[p.length - 1]}, ${p.slice(0, -1).map(x => x[0].toUpperCase() + '.').join(' ')}` }
 function toApa(w: any): string | null {
   const auth: string[] = (w.authorships ?? []).map((a: any) => a.author?.display_name).filter(Boolean).slice(0, 20).map(apaName)
@@ -100,12 +131,12 @@ async function findReferences(db: any, project: Record<string, any>) {
     const q = JSON.parse(t.slice(t.indexOf('['), t.lastIndexOf(']') + 1))
     if (Array.isArray(q) && q.length) queries = [project.topic, ...q.map(String)].slice(0, 7)
   } catch { /* use the topic alone */ }
-  const pools: any[][] = await Promise.all(queries.map(q => fetch(`https://api.openalex.org/works?search=${encodeURIComponent(q)}&filter=from_publication_date:2020-01-01,to_publication_date:2025-12-31,type:article&per-page=15&mailto=projects@famzuk.app`, { signal: AbortSignal.timeout(15000) }).then(r => r.ok ? r.json() : { results: [] }).then(j => j.results ?? []).catch(() => [])))
-  const seen = new Set<string>(); const lines: string[] = []
-  for (let i = 0; i < 15; i++) for (const pool of pools) { const w = pool[i]; if (!w) continue; const key = String(w.title).toLowerCase(); const line = toApa(w); if (line && !seen.has(key) && !known.has(line)) { seen.add(key); lines.push(line) } }
+  const pools: any[][] = await Promise.all(queries.map(q => fetch(`https://api.openalex.org/works?search=${encodeURIComponent(q)}&filter=from_publication_date:2020-01-01,to_publication_date:2025-12-31,type:article,has_abstract:true&per-page=15&mailto=projects@famzuk.app`, { signal: AbortSignal.timeout(15000) }).then(r => r.ok ? r.json() : { results: [] }).then(j => j.results ?? []).catch(() => [])))
+  const seen = new Set<string>(); const lines: string[] = []; const abs = new Map<string, string>()
+  for (let i = 0; i < 15; i++) for (const pool of pools) { const w = pool[i]; if (!w) continue; const key = String(w.title).toLowerCase(); const line = toApa(w); if (line && !seen.has(key) && !known.has(line)) { seen.add(key); lines.push(line); abs.set(line, abstractOf(w)) } }
   const pick = lines.slice(0, 30 - known.size)
   const results = await Promise.all(pick.map(checkLink))
-  const rows = pick.map((l, i) => ({ project_id: project.id, citation: l, provenance: results[i] === 'verified' ? 'verified' : 'needs_verification' }))
+  const rows = pick.map((l, i) => ({ project_id: project.id, citation: l, abstract: abs.get(l) ?? null, provenance: results[i] === 'verified' ? 'verified' : 'needs_verification' }))
   if (rows.length) await db.from('project_sources').insert(rows)
   return { added: rows.length, verified: rows.filter(r => r.provenance === 'verified').length }
 }
@@ -163,30 +194,37 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     if (action === 'find_references') return res.json({ ok: true, ...(await findReferences(db, project)) })
     if (action === 'generate_section') {
       const { data: s } = await db.from('project_sections').select('*').eq('id', sectionId).eq('project_id', projectId).single()
+      const { data: ch } = await db.from('project_chapters').select('position').eq('id', s.chapter_id).single()
       const { data: mem } = await db.from('project_memory').select('data').eq('project_id', projectId).single()
-      const { data: src } = await db.from('project_sources').select('citation').eq('project_id', projectId).neq('provenance', 'ai_generated').limit(40)
-      const refs = (src ?? []).map((x: any) => x.citation.replace(/https?:\/\/\S+/g, '').trim())
+      const { data: src } = await db.from('project_sources').select('citation,abstract').eq('project_id', projectId).neq('provenance', 'ai_generated')
       const { count: nSec } = await db.from('project_sections').select('id', { count: 'exact', head: true }).eq('project_id', projectId)
+      const strict = (ch?.position ?? 9) <= 2
       const perSection = Math.round((project.target_pages * 300) / Math.max(1, nSec ?? 40))
       const eight = /^(background( of the study)?|statement of the problem)$/i.test(s.heading)
-      const wantsSearch = true
+      if (strict && (src?.length ?? 0) < 5) return res.status(400).json({ error: 'Find references first (Sources page). Chapters 1 and 2 need real citations.' })
       await db.from('project_sections').update({ status: 'generating' }).eq('id', sectionId)
       try {
-        const cite = refs.length
-          ? `REFERENCE LIST (cite ONLY from this list, never anything else):\n${refs.join('\n')}\nIn-text citations use APA style: (Author, Year) for 1 author, (Author & Author, Year) for 2 authors, and (Author et al., Year) for 3 or more authors.`
-          : 'No references are available, so do not include in-text citations.'
-        const shape = eight
-          ? 'Write exactly 8 paragraphs, each about 100 to 140 words. Every paragraph must end with an in-text citation from the reference list.'
-          : `Target about ${perSection} words. Cite from the reference list only where a statement truly relies on a source.`
-        const text = await gemini(
-          `Project memory: ${JSON.stringify(mem?.data)}\nTopic: ${project.topic}\n${cite}\nWrite section "${s.heading}". ${shape}${wantsSearch ? ' Use Google Search for current facts; do not state any statistic you did not find.' : ''}`,
-          RULES, { search: wantsSearch })
-        await db.from('project_sections').update({ content: clean(text), status: 'completed', updated_at: new Date().toISOString() }).eq('id', sectionId)
+        const picked = pickRefs(src ?? [], `${project.topic} ${s.heading}`, 12)
+        const list = picked.map((x: any, i: number) => `[${i + 1}] ${String(x.citation).replace(/https?:\/\/\S+/g, '').trim()}\nABSTRACT: ${String(x.abstract || 'not available').slice(0, 450)}`).join('\n\n')
+        const shape = eight ? 'Write exactly 8 paragraphs of about 100 to 140 words each.' : `Write about ${perSection} words in short paragraphs.`
+        const prompt = `Project memory: ${JSON.stringify(mem?.data)}\nTopic: ${project.topic}\nSOURCES:\n${list}\n${strict ? CITE_STRICT : CITE_LOOSE}\nWrite section "${s.heading}". ${shape} Use Google Search for current facts; do not state any statistic you did not find.`
+        let r1 = checkText(clean(await gemini(prompt, RULES, { search: true })), picked, strict)
+        if (strict && (!r1.ok || r1.missing)) r1 = checkText(clean(await gemini(prompt + '\nFIX: your last draft had citations not in the list, or paragraphs without a citation. Every paragraph must end with a citation from the list.', RULES, { search: true })), picked, strict)
+        await db.from('project_sections').update({ content: r1.text, status: 'completed', updated_at: new Date().toISOString() }).eq('id', sectionId)
         return res.json({ ok: true })
       } catch (e) {
         await db.from('project_sections').update({ status: 'failed' }).eq('id', sectionId)
         throw e
       }
+    }
+    if (action === 'correct_section') {
+      const instruction = String(req.body?.instruction ?? '').slice(0, 4000)
+      const { data: s } = await db.from('project_sections').select('*').eq('id', sectionId).eq('project_id', projectId).single()
+      const { data: src } = await db.from('project_sources').select('citation,abstract').eq('project_id', projectId).neq('provenance', 'ai_generated')
+      const picked = pickRefs(src ?? [], `${project.topic} ${s.heading} ${instruction}`, 12)
+      const list = picked.map((x: any, i: number) => `[${i + 1}] ${String(x.citation).replace(/https?:\/\/\S+/g, '').trim()}\nABSTRACT: ${String(x.abstract || 'not available').slice(0, 450)}`).join('\n\n')
+      const out = await gemini(`Topic: ${project.topic}\nSection "${s.heading}" currently reads:\n${s.content}\n\nLECTURER CORRECTION:\n${instruction}\n\nRewrite the section applying this correction. Change only what is needed and keep everything else. Keep the citation style. ${CITE_LOOSE}\nSOURCES:\n${list}`, RULES, { search: true })
+      return res.json({ ok: true, text: fixCitations(clean(out), picked).text })
     }
     return res.status(400).json({ error: 'Unknown action' })
   } catch (e) {
