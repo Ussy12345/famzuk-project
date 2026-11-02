@@ -7,13 +7,26 @@ import { exportPdf, exportDocx } from '../lib/export'
 type Row = Record<string, any>
 const sleep = (ms: number) => new Promise(r => setTimeout(r, ms))
 
+function useTimed(active: boolean, expected: number) {
+  const [t, setT] = useState(0)
+  useEffect(() => { if (!active) { setT(0); return } const t0 = Date.now(); const i = setInterval(() => setT((Date.now() - t0) / 1000), 500); return () => clearInterval(i) }, [active])
+  return { pct: active ? Math.min(95, Math.round((t / expected) * 100)) : 0, left: Math.max(5, Math.round(expected - t)), over: t > expected }
+}
+function Ring({ pct, label, sub }: { pct: number; label?: string; sub?: string }) {
+  const r = 34, c = 2 * Math.PI * r
+  return <div className="flex items-center gap-4" role="progressbar" aria-valuenow={pct}>
+    <div className="relative h-[84px] w-[84px] shrink-0"><svg width="84" height="84" viewBox="0 0 84 84" className="-rotate-90"><circle cx="42" cy="42" r={r} fill="none" stroke="#d6d1c8" strokeWidth="8" /><circle cx="42" cy="42" r={r} fill="none" stroke="#c8893a" strokeWidth="8" strokeLinecap="round" strokeDasharray={c} strokeDashoffset={c * (1 - pct / 100)} className="transition-all duration-500" /></svg><span className="absolute inset-0 flex items-center justify-center text-sm font-semibold">{pct}%</span></div>
+    <div><p className="font-medium">{label}</p>{sub && <p className="text-sm text-ink/60">{sub}</p>}</div></div>
+}
+const NUM = ['ONE', 'TWO', 'THREE', 'FOUR', 'FIVE', 'SIX', 'SEVEN']
+const PRELIM = ['Title Page', 'Certification', 'Approval Page', 'Dedication', 'Acknowledgments', 'Abstract', 'Table of Contents', 'List of Tables', 'List of Figures']
 function useProject() {
   const { id } = useParams(); const [p, setP] = useState<Row | null>(null)
   const reload = () => supabase.from('projects').select('*').eq('id', id).single().then(({ data }) => setP(data))
   useEffect(() => { reload() }, [id]); return { id: id!, p, reload }
 }
 function Shell({ id, p, children }: { id: string; p: Row | null; children: ReactNode }) {
-  const links = [['', 'Overview'], ['interview', 'Interview'], ['generate', 'Generate'], ['editor', 'Editor'], ['sources', 'Sources'], ['settings', 'Settings']]
+  const links = [['', 'Overview'], ['generate', 'Generate'], ['editor', 'Editor'], ['sources', 'Sources'], ['settings', 'Settings']]
   return (
     <div className="mx-auto flex max-w-6xl flex-col gap-6 p-5 md:flex-row">
       <nav className="shrink-0 md:w-48"><Link to="/dashboard" className="text-sm underline">← Dashboard</Link><p className="font-display my-3 font-semibold">{p?.topic}</p>
@@ -45,36 +58,47 @@ export function Interview() {
 }
 
 export function Generate() {
-  const { id, p, reload } = useProject(); const [pages, setPages] = useState(40); const [secs, setSecs] = useState<Row[]>([]); const [chs, setChs] = useState<Row[]>([]); const [act, setAct] = useState(''); const [run, setRun] = useState(false); const stop = useRef(false)
+  const { id, p, reload } = useProject(); const [pages, setPages] = useState(40); const [secs, setSecs] = useState<Row[]>([]); const [chs, setChs] = useState<Row[]>([]); const [act, setAct] = useState(''); const [run, setRun] = useState(false); const [planning, setPlanning] = useState(false); const [err, setErr] = useState(''); const [searched, setSearched] = useState<boolean | null>(null); const stop = useRef(false); const [refBusy, setRefBusy] = useState(false); const [eta, setEta] = useState(0); const tp = useTimed(planning, 60); const tr = useTimed(refBusy, 75)
   const load = async () => { const [a, b] = await Promise.all([supabase.from('project_chapters').select('*').eq('project_id', id).order('position'), supabase.from('project_sections').select('*').eq('project_id', id).order('position')]); setChs(a.data ?? []); setSecs(b.data ?? []); return b.data ?? [] }
-  useEffect(() => { load() }, [id])
+  useEffect(() => { load() }, [id]); useEffect(() => { if (p?.target_pages) setPages(p.target_pages) }, [p?.target_pages])
+  async function plan() { setPlanning(true); setErr(''); await supabase.from('projects').update({ target_pages: pages }).eq('id', id); const r = await callAI({ action: 'plan', projectId: id }); if (r.error) setErr(r.error); else setSearched(!!r.searched); await load(); setPlanning(false); reload() }
+  async function remove(sid: string) { await supabase.from('project_sections').delete().eq('id', sid); load() }
   async function start() {
-    setRun(true); stop.current = false; await supabase.from('projects').update({ target_pages: pages, status: 'generating' }).eq('id', id)
-    if (!chs.length) { let pos = 0; setAct('Preparing structure…')
-      for (const [i, c] of buildTemplate(p?.project_type ?? '').entries()) { const { data: ch } = await supabase.from('project_chapters').insert({ project_id: id, position: i + 1, title: c.title }).select().single()
-        for (const h of c.sections) { const { data: s } = await supabase.from('project_sections').insert({ project_id: id, chapter_id: ch!.id, position: ++pos, heading: h }).select().single(); await supabase.from('project_generation_jobs').insert({ project_id: id, chapter_id: ch!.id, section_id: s!.id }) } } }
-    const gaveUp = new Set<string>(); const tries: Record<string, number> = {}
+    setRun(true); stop.current = false; await supabase.from('projects').update({ status: 'generating' }).eq('id', id)
+    const have = await supabase.from('project_sources').select('id', { count: 'exact', head: true }).eq('project_id', id)
+    if (!have.count) { setRefBusy(true); setAct('Finding and checking real references with Google Search…'); await callAI({ action: 'find_references', projectId: id }); setRefBusy(false) }
+    const t0 = Date.now(); let n0 = 0; const gaveUp = new Set<string>(); const tries: Record<string, number> = {}
     for (;;) {
       const all = await load(); const s = all.find(x => x.status !== 'completed' && !gaveUp.has(x.id)); if (!s || stop.current) break
-      const ch = (await supabase.from('project_chapters').select('title').eq('id', s.chapter_id).single()).data
-      setAct(`Writing ${ch?.title} — ${s.heading}`); tries[s.id] = (tries[s.id] ?? 0) + 1
+      setAct(`Writing ${chs.find(c => c.id === s.chapter_id)?.title ?? ''} — ${s.heading}`); tries[s.id] = (tries[s.id] ?? 0) + 1
       await supabase.from('project_generation_jobs').update({ status: 'running', attempts: tries[s.id], started_at: new Date().toISOString() }).eq('section_id', s.id)
       const r = await callAI({ action: 'generate_section', projectId: id, sectionId: s.id })
-      if (r.ok) await supabase.from('project_generation_jobs').update({ status: 'completed', completed_at: new Date().toISOString() }).eq('section_id', s.id)
-      else { await supabase.from('project_generation_jobs').update({ status: 'failed', error: r.error }).eq('section_id', s.id); if (tries[s.id] >= 3) gaveUp.add(s.id); setAct(r.error ?? 'Retrying…'); await sleep(/Rate/.test(r.error ?? '') ? 30000 : 3000) }
+      if (r.auth || /out of quota/i.test(r.error ?? '')) stop.current = true
+      if (r.ok) { n0++; setEta(Math.round(((Date.now() - t0) / 1000 / n0) * (all.filter(x => x.status !== 'completed').length - 1))); await supabase.from('project_generation_jobs').update({ status: 'completed', completed_at: new Date().toISOString() }).eq('section_id', s.id) }
+      else { await supabase.from('project_generation_jobs').update({ status: 'failed', error: r.error }).eq('section_id', s.id); if (tries[s.id] >= 3) gaveUp.add(s.id); setAct(r.error ?? 'Retrying…'); await sleep(/Rate|internet|Network/i.test(r.error ?? '') ? 30000 : 3000) }
       await sleep(1500)
     }
     const fin = await load(); await supabase.from('projects').update({ status: fin.every(x => x.status === 'completed') ? 'review' : 'failed' }).eq('id', id); setRun(false); setAct(''); reload()
   }
-  const done = secs.filter(s => s.status === 'completed').length; const pct = secs.length ? Math.round((done / secs.length) * 100) : 0
+  const done = secs.filter(s => s.status === 'completed').length; const pct = secs.length ? Math.round((done / secs.length) * 100) : 0; const started = done > 0 || run
   const icon = (st: string) => (st === 'completed' ? '✓' : st === 'generating' ? '…' : st === 'failed' ? '!' : '○')
-  return <Shell id={id} p={p}><h1 className="font-display text-2xl font-semibold">Generate your project</h1>
+  return <Shell id={id} p={p}><h1 className="font-display text-2xl font-semibold">Your project</h1>
     {!secs.length && <div className="mt-4"><p className="font-medium">How detailed should your project be?</p><p className="mb-3 text-sm text-ink/60">Page count is approximate. Real length depends on font, spacing, tables, figures and references.</p>
-      <div className="flex flex-wrap gap-2">{[20, 40, 60, 80, 100].map(n => <button key={n} onClick={() => setPages(n)} className={`rounded-lg border px-4 py-2 ${pages === n ? 'border-brand bg-brand/10' : 'border-ink/20 bg-white'}`}>{n}{n === 100 ? '+' : ''} pages</button>)}</div></div>}
-    {secs.length > 0 && <div className="mt-4"><div className="h-3 overflow-hidden rounded-full bg-ink/10"><div className="h-full bg-brand transition-all" style={{ width: `${pct}%` }} /></div><p className="mt-1 text-sm">{pct}% — {act || (done === secs.length ? 'All sections written' : 'Paused')}</p>
-      <ul className="mt-4 space-y-3">{chs.map(c => { const s = secs.filter(x => x.chapter_id === c.id); return <li key={c.id}><b>{icon(s.every(x => x.status === 'completed') ? 'completed' : s.some(x => x.status === 'generating') ? 'generating' : s.some(x => x.status === 'failed') ? 'failed' : 'pending')} Chapter {c.position}: {c.title}</b><span className="ml-2 text-sm text-ink/60">{s.filter(x => x.status === 'completed').length}/{s.length} sections</span></li> })}</ul></div>}
-    <div className="mt-6 flex gap-3"><button className="btn-primary" disabled={run} onClick={start}>{secs.length ? (run ? 'Generating…' : 'Continue generation') : 'Start generation'}</button>{run && <button className="btn-ghost" onClick={() => (stop.current = true)}>Pause</button>}{done > 0 && !run && <Link className="btn-ghost" to={`/projects/${id}/editor`}>Open editor</Link>}</div>
-    <p className="mt-3 text-sm text-ink/60">Keep this tab open while generating. Each section is saved as soon as it is written; failed sections are retried on their own.</p></Shell>
+      <div className="flex flex-wrap gap-2">{[20, 40, 60, 80, 100].map(n => <button key={n} onClick={() => setPages(n)} className={`rounded-lg border px-4 py-2 ${pages === n ? 'border-gold bg-gold/10' : 'border-line bg-white'}`}>{n}{n === 100 ? '+' : ''} pages</button>)}</div>
+      <button className="btn-gold mt-5" disabled={planning} onClick={plan}>{planning ? 'Working…' : 'Create my table of contents'}</button>{planning && <div className="mt-5"><Ring pct={tp.pct} label="Researching your topic with Google Search and building your contents" sub={tp.over ? 'Almost done…' : `About ${tp.left}s left`} /></div>}</div>}
+    {err && <p role="alert" className="mt-3 text-sm text-red-700">{err} <button className="underline" onClick={plan}>Retry</button></p>}
+    {secs.length > 0 && <div className="mt-4">
+      {started ? <>{refBusy ? <Ring pct={tr.pct} label="Finding and checking real references…" sub={tr.over ? 'Almost done…' : `About ${tr.left}s left`} /> : <Ring pct={pct} label={act || (done === secs.length ? 'All sections written' : 'Paused')} sub={run && eta > 0 ? `About ${eta >= 90 ? Math.round(eta / 60) + ' min' : eta + 's'} left` : undefined} />}</>
+        : <p className="text-sm text-ink/70">This table of contents was planned for your topic using Google Search research. Remove any section you do not want, or regenerate it, then approve to start writing.</p>}
+      {searched === true && <p className="mt-3 text-sm text-green-800">This outline was checked against Google Search results.</p>}{searched === false && <p className="mt-3 text-sm text-amber-800">Google Search was unavailable (quota), so this outline came from the AI's own knowledge. Please review it before approving.</p>}
+      <div className="mt-4 rounded-xl border border-line bg-white p-5"><h2 className="font-display text-lg font-semibold">TABLE OF CONTENTS</h2>
+        <p className="mt-3 font-semibold">Preliminary Pages</p><ul className="ml-5 mt-1 list-disc text-sm">{PRELIM.map(x => <li key={x}>{x}</li>)}</ul>
+        <ul className="mt-4 space-y-4">{chs.map(c => <li key={c.id}><b>CHAPTER {NUM[c.position - 1] ?? c.position}: {String(c.title).toUpperCase()}</b><ul className="mt-1 space-y-1">{secs.filter(x => x.chapter_id === c.id).map((x, j) => <li key={x.id} className="flex items-center justify-between gap-2 text-sm"><span>{started ? icon(x.status) + ' ' : ''}{c.position}.{j + 1} {x.heading}</span>{!started && <button aria-label="Remove section" className="px-2 text-ink/40 hover:text-red-700" onClick={() => remove(x.id)}>×</button>}</li>)}</ul></li>)}</ul><ul className="ml-5 mt-4 list-disc text-sm"><li>References</li><li>Appendices</li></ul></div></div>}
+    {secs.length > 0 && <div className="mt-6 flex flex-wrap gap-3">
+      {!started && <button className="btn-ghost" disabled={planning} onClick={plan}>{planning ? 'Regenerating…' : 'Regenerate contents'}</button>}
+      <button className="btn-gold" disabled={run || planning} onClick={start}>{run ? 'Writing…' : started ? 'Continue writing' : 'Approve and start writing'}</button>
+      {run && <button className="btn-ghost" onClick={() => (stop.current = true)}>Pause</button>}{done > 0 && !run && <Link className="btn-ghost" to={`/projects/${id}/editor`}>Open editor</Link>}</div>}
+    <p className="mt-3 text-sm text-ink/60">Keep this tab open while writing. Each section is saved as soon as it is done; failed sections retry on their own.</p></Shell>
 }
 
 export function Editor() {
@@ -97,9 +121,10 @@ export function Editor() {
 }
 
 export function Sources() {
-  const { id, p } = useProject(); const [rows, setRows] = useState<Row[]>([]); const [c, setC] = useState('')
+  const { id, p } = useProject(); const [rows, setRows] = useState<Row[]>([]); const [c, setC] = useState(''); const [fb, setFb] = useState(''), [fbusy, setFbusy] = useState(false); const tf = useTimed(fbusy, 75)
   const load = () => supabase.from('project_sources').select('*').eq('project_id', id).order('created_at').then(({ data }) => setRows(data ?? [])); useEffect(() => { load() }, [id])
   return <Shell id={id} p={p}><h1 className="font-display text-2xl font-semibold">Sources</h1><p className="mb-4 text-sm text-ink/60">Add only real sources. The AI never invents references. Mark a source “verified” once you have checked it.</p>
+    <div className="mb-4"><button className="btn-gold" disabled={fbusy} onClick={async () => { setFbusy(true); setFb(''); const r = await callAI({ action: 'find_references', projectId: id }); setFbusy(false); setFb(r.error ?? `Added ${r.added} references (${r.verified} link-checked). Open each link to confirm it.`); load() }}>{fbusy ? 'Searching…' : 'Find 30 references with AI'}</button>{fbusy && <div className="mt-3"><Ring pct={tf.pct} label="Searching scholarly databases and checking links" sub={tf.over ? 'Almost done…' : `About ${tf.left}s left`} /></div>}{fb && <p className="mt-2 text-sm">{fb}</p>}</div>
     <div className="flex gap-2"><input className="input" placeholder="Full citation" value={c} onChange={e => setC(e.target.value)} /><button className="btn-primary" disabled={!c.trim()} onClick={async () => { await supabase.from('project_sources').insert({ project_id: id, citation: c }); setC(''); load() }}>Add</button></div>
     <ul className="mt-4 space-y-2">{rows.map(r => <li key={r.id} className="flex flex-wrap items-center gap-2 rounded-lg border border-ink/10 bg-white p-3"><span className="min-w-0 flex-1">{r.citation}</span>
       <select className="input !w-auto" value={r.provenance} onChange={async e => { await supabase.from('project_sources').update({ provenance: e.target.value }).eq('id', r.id); load() }}>{['student_provided', 'needs_verification', 'verified', 'ai_generated'].map(x => <option key={x} value={x}>{x.replace('_', ' ')}</option>)}</select>

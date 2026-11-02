@@ -13,9 +13,9 @@ export default function NewProject() {
   const ok = [!!f.course, !!f.level, !!f.institution.trim(), f.topic.trim().length > 5, !!f.type][step]
   async function create() {
     const { data: u } = await supabase.auth.getUser()
-    const { data, error } = await supabase.from('projects').insert({ user_id: u.user!.id, course_id: f.course!.id, course_name: f.course!.name, level: f.level, institution: f.institution, topic: f.topic, project_type: f.type, status: 'interview' }).select('id').single()
+    const { data, error } = await supabase.from('projects').insert({ user_id: u.user!.id, course_id: f.course!.id, course_name: f.course!.name, level: f.level, institution: f.institution, topic: f.topic, project_type: f.type, status: 'ready' }).select('id').single()
     if (error) return setErr(error.message)
-    nav(`/projects/${data.id}/interview`)
+    nav(`/projects/${data.id}/generate`)
   }
   const pick = (opts: string[], cur: string, set: (v: string) => void) => (
     <div className="grid gap-2 sm:grid-cols-2">{opts.map(o => <button key={o} onClick={() => set(o)} className={`rounded-lg border p-3 text-left ${cur === o ? 'border-brand bg-brand/10' : 'border-ink/20 bg-white'}`}>{o}</button>)}</div>)
