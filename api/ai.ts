@@ -1,3 +1,4 @@
+import './net'
 import type { VercelRequest, VercelResponse } from '@vercel/node'
 import { createClient } from '@supabase/supabase-js'
 import dns from 'node:dns'
@@ -31,7 +32,7 @@ async function gemini(prompt: string, system: string, o: Opts = {}): Promise<str
     } else {
       const body = await r.text()
       last = `${r.status} ${model} search=${!!o.search}: ${body.slice(0, 220).replace(/\s+/g, ' ')}`
-      if (r.status === 429 && o.search && /quota|RESOURCE_EXHAUSTED/i.test(body)) { if (process.env.REQUIRE_SEARCH !== 'false') throw Object.assign(new Error('search_quota'), { code: 'search_quota' }); console.warn('Search quota exhausted; continuing without Google Search'); o.search = false; return gemini(prompt, system, o) }
+      if (r.status === 429 && o.search && /quota|RESOURCE_EXHAUSTED/i.test(body)) { if (process.env.TAVILY_API_KEY) { const ctx = await webContext(prompt); o.search = false; return gemini(ctx ? prompt + '\n\nWEB SEARCH RESULTS (use these for current facts and structure, do not invent anything beyond them):\n' + ctx : prompt, system, o) } if (process.env.REQUIRE_SEARCH !== 'false') throw Object.assign(new Error('search_quota'), { code: 'search_quota' }); console.warn('Search quota exhausted; continuing without Google Search'); o.search = false; return gemini(prompt, system, o) }
       if (![429, 500, 502, 503, 504].includes(r.status)) throw new Error(`gemini_${last}`)
       const m = body.match(/"retryDelay":\s*"(\d+)/)
       var wait = Math.min(25, m ? Number(m[1]) + 1 : 3 * (i + 1))
@@ -40,6 +41,17 @@ async function gemini(prompt: string, system: string, o: Opts = {}): Promise<str
     await new Promise(res => setTimeout(res, (wait || 3) * 1000))
   }
   throw Object.assign(new Error('busy: ' + last), { code: 429 })
+}
+
+async function webContext(prompt: string): Promise<string> {
+  const topic = prompt.match(/Topic: (.+)/)?.[1] ?? ''
+  const heading = prompt.match(/section "(.+?)"/)?.[1] ?? 'structure of project chapters'
+  try {
+    const r = await fetch('https://api.tavily.com/search', { method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${process.env.TAVILY_API_KEY}` }, body: JSON.stringify({ query: `${topic} ${heading}`.slice(0, 300), max_results: 6 }), signal: AbortSignal.timeout(30000) })
+    if (!r.ok) return ''
+    const j = await r.json()
+    return (j.results ?? []).map((x: any) => `- ${x.title} (${x.url}): ${String(x.content).slice(0, 400)}`).join('\n')
+  } catch { return '' }
 }
 
 function clean(t: string): string {
@@ -120,7 +132,7 @@ async function planProject(db: any, project: Record<string, any>) {
     await db.from('project_generation_jobs').insert((secs ?? []).map((x: any) => ({ project_id: project.id, chapter_id: ch!.id, section_id: x.id })))
   }
   await db.from('projects').update({ status: 'ready' }).eq('id', project.id)
-  return !!o.search
+  return !!o.search || !!process.env.TAVILY_API_KEY
 }
 
 export default async function handler(req: VercelRequest, res: VercelResponse) {
