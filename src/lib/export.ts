@@ -30,3 +30,18 @@ export async function exportDocx(id: string) {
   const doc = new Document({ sections: [{ children: kids, footers: { default: new Footer({ children: [new Paragraph({ alignment: AlignmentType.CENTER, children: [new TextRun({ children: [PageNumber.CURRENT] })] })] }) } }] })
   const a = document.createElement('a'); a.href = URL.createObjectURL(await Packer.toBlob(doc)); a.download = `${String(p.topic).slice(0, 40)}.docx`; a.click()
 }
+
+// Download only one section (used for corrected pages).
+export async function exportSectionPdf(title: string, text: string) {
+  const { jsPDF } = await import('jspdf'); const d = new jsPDF({ unit: 'pt', format: 'a4' }); const W = d.internal.pageSize.getWidth(), H = d.internal.pageSize.getHeight(), m = 72; let y = m
+  d.setFont('times', 'bold'); d.setFontSize(14); for (const l of d.splitTextToSize(title, W - 2 * m)) { d.text(l, m, y); y += 22 } y += 8
+  d.setFont('times', 'normal'); d.setFontSize(12)
+  for (const l of d.splitTextToSize(clean(text), W - 2 * m)) { if (y > H - m) { d.addPage(); y = m } d.text(l, m, y); y += 18 }
+  const n = d.getNumberOfPages(); for (let i = 1; i <= n; i++) { d.setPage(i); d.setFontSize(10); d.text(String(i), W / 2, H - 36, { align: 'center' }) }
+  d.save(`${title.slice(0, 40)}.pdf`)
+}
+export async function exportSectionDocx(title: string, text: string) {
+  const { Document, Packer, Paragraph, HeadingLevel, TextRun } = await import('docx')
+  const kids = [new Paragraph({ text: title, heading: HeadingLevel.HEADING_2 }), ...clean(text).split(/\n+/).map(t => new Paragraph({ spacing: { after: 160, line: 360 }, children: [new TextRun({ text: t, font: 'Times New Roman', size: 24 })] }))]
+  const a = document.createElement('a'); a.href = URL.createObjectURL(await Packer.toBlob(new Document({ sections: [{ children: kids }] }))); a.download = `${title.slice(0, 40)}.docx`; a.click()
+}

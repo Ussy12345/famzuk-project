@@ -8,7 +8,7 @@ try { process.loadEnvFile() } catch { /* no .env on Render, uses dashboard varia
 const app = express()
 const dist = path.join(path.dirname(fileURLToPath(import.meta.url)), 'dist')
 
-app.use(express.json({ limit: '1mb' }))
+app.use(express.json({ limit: '12mb' }))
 app.post('/api/ai', (req, res) => {
   handler(req as any, res as any).catch((e: unknown) => { console.error(e); res.status(500).json({ error: 'Server error' }) })
 })

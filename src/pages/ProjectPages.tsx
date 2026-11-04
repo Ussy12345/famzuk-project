@@ -3,7 +3,7 @@ import { Link, NavLink, useNavigate, useParams } from 'react-router-dom'
 import { supabase, callAI } from '../lib/supabase'
 import { buildTemplate } from '../lib/templates'
 import { clean } from '../lib/clean'
-import { exportPdf, exportDocx } from '../lib/export'
+import { exportPdf, exportDocx, exportSectionPdf, exportSectionDocx } from '../lib/export'
 type Row = Record<string, any>
 const sleep = (ms: number) => new Promise(r => setTimeout(r, ms))
 
@@ -20,18 +20,51 @@ function Ring({ pct, label, sub }: { pct: number; label?: string; sub?: string }
 }
 const NUM = ['ONE', 'TWO', 'THREE', 'FOUR', 'FIVE', 'SIX', 'SEVEN']
 const PRELIM = ['Title Page', 'Certification', 'Approval Page', 'Dedication', 'Acknowledgments', 'Abstract', 'Table of Contents', 'List of Tables', 'List of Figures']
+async function toJpeg(file: File): Promise<{ data: string; mime: string }> {
+  const bmp = await createImageBitmap(file); const k = Math.min(1, 1800 / Math.max(bmp.width, bmp.height))
+  const c = document.createElement('canvas'); c.width = Math.round(bmp.width * k); c.height = Math.round(bmp.height * k)
+  c.getContext('2d')!.drawImage(bmp, 0, 0, c.width, c.height)
+  return { data: c.toDataURL('image/jpeg', 0.82).split(',')[1], mime: 'image/jpeg' }
+}
 function useProject() {
   const { id } = useParams(); const [p, setP] = useState<Row | null>(null)
   const reload = () => supabase.from('projects').select('*').eq('id', id).single().then(({ data }) => setP(data))
   useEffect(() => { reload() }, [id]); return { id: id!, p, reload }
 }
-function Shell({ id, p, children }: { id: string; p: Row | null; children: ReactNode }) {
+function Shell({ id, p, children, extra, wide }: { id: string; p: Row | null; children: ReactNode; extra?: (done: () => void) => ReactNode; wide?: boolean }) {
+  const nav = useNavigate(); const [open, setOpen] = useState(false)
   const links = [['', 'Overview'], ['generate', 'Generate'], ['editor', 'Editor'], ['sources', 'Sources'], ['settings', 'Settings']]
+  const done = () => setOpen(false)
+  useEffect(() => {
+    if (!open) return
+    const k = (e: KeyboardEvent) => { if (e.key === 'Escape') setOpen(false) }
+    document.addEventListener('keydown', k); const o = document.body.style.overflow; document.body.style.overflow = 'hidden'
+    return () => { document.removeEventListener('keydown', k); document.body.style.overflow = o }
+  }, [open])
+  const side = (
+    <div className="flex h-full min-h-0 flex-col">
+      <Link to="/dashboard" onClick={done} className="text-sm text-ink/60 hover:underline">← All projects</Link>
+      <p className="font-display mb-4 mt-3 line-clamp-3 font-semibold leading-snug">{p?.topic}</p>
+      <nav className="flex flex-col gap-1">{links.map(([t, n]) => (
+        <NavLink key={t} end to={`/projects/${id}/${t}`} onClick={done} className={({ isActive }) => `rounded-xl px-3 py-2.5 text-sm font-medium ${isActive ? 'bg-brand text-white' : 'hover:bg-tab'}`}>{n}</NavLink>))}</nav>
+      {extra && <div className="mt-4 min-h-0 flex-1 overflow-y-auto border-t border-line pt-3">{extra(done)}</div>}
+      <div className="mt-auto flex gap-4 border-t border-line pt-3 text-sm">
+        <Link to="/profile" onClick={done} className="text-ink/70 hover:underline">Profile</Link>
+        <button className="text-ink/70 hover:underline" onClick={async () => { await supabase.auth.signOut(); nav('/') }}>Log out</button>
+      </div>
+    </div>)
   return (
-    <div className="mx-auto flex max-w-6xl flex-col gap-6 p-5 md:flex-row">
-      <nav className="shrink-0 md:sticky md:top-5 md:w-48 md:self-start"><Link to="/dashboard" className="text-sm underline">← Dashboard</Link><p className="font-display my-3 font-semibold">{p?.topic}</p>
-        <div className="flex flex-wrap gap-1 md:flex-col">{links.map(([t, n]) => <NavLink key={t} end to={`/projects/${id}/${t}`} className={({ isActive }) => `rounded-lg px-3 py-2 text-sm ${isActive ? 'bg-brand text-white' : 'hover:bg-ink/5'}`}>{n}</NavLink>)}</div></nav>
-      <main className="min-w-0 flex-1">{children}</main>
+    <div className="min-h-screen lg:flex">
+      <aside className="hidden border-r border-line bg-white p-4 lg:sticky lg:top-0 lg:flex lg:h-screen lg:w-72 lg:shrink-0 lg:flex-col">{side}</aside>
+      <header className="sticky top-0 z-40 flex items-center gap-3 border-b border-line bg-white px-4 py-3 lg:hidden">
+        <button className="btn-primary !px-3 !py-1.5 text-sm" aria-label="Open menu" onClick={() => setOpen(true)}>☰ Menu</button>
+        <span className="font-display min-w-0 truncate text-sm font-semibold">{p?.topic}</span>
+      </header>
+      {open && <div className="fixed inset-0 z-50 lg:hidden">
+        <div className="absolute inset-0 bg-ink/50" onClick={done} />
+        <div role="dialog" aria-modal="true" aria-label="Project menu" className="absolute left-0 top-0 h-full w-80 max-w-[85vw] bg-white p-4 shadow-xl">{side}</div>
+      </div>}
+      <main className="min-w-0 flex-1 p-4 sm:p-6"><div className={wide ? '' : 'mx-auto max-w-3xl'}>{children}</div></main>
     </div>)
 }
 
@@ -101,30 +134,140 @@ export function Generate() {
     <p className="mt-3 text-sm text-ink/60">Keep this tab open while writing. Each section is saved as soon as it is done; failed sections retry on their own.</p></Shell>
 }
 
+function Modal({ title, onClose, children }: { title: string; onClose: () => void; children: ReactNode }) {
+  useEffect(() => {
+    const k = (e: KeyboardEvent) => { if (e.key === 'Escape') onClose() }
+    document.addEventListener('keydown', k); const o = document.body.style.overflow; document.body.style.overflow = 'hidden'
+    return () => { document.removeEventListener('keydown', k); document.body.style.overflow = o }
+  }, [])
+  return (
+    <div className="fixed inset-0 z-50 flex items-end justify-center bg-ink/50 sm:items-center sm:p-4" onClick={onClose}>
+      <div role="dialog" aria-modal="true" aria-label={title} onClick={e => e.stopPropagation()} className="flex max-h-[92vh] w-full flex-col rounded-t-2xl bg-white shadow-xl sm:max-w-2xl sm:rounded-2xl">
+        <div className="flex items-center justify-between border-b border-line px-5 py-3"><h2 className="font-display text-lg font-semibold">{title}</h2><button aria-label="Close" className="rounded-lg px-3 py-1 text-2xl leading-none text-ink/60 hover:bg-tab" onClick={onClose}>×</button></div>
+        <div className="overflow-y-auto p-5">{children}</div>
+      </div>
+    </div>)
+}
+
 export function Editor() {
-  const { id, p } = useProject(); const [chs, setChs] = useState<Row[]>([]); const [secs, setSecs] = useState<Row[]>([]); const [sel, setSel] = useState<string>(''); const [edit, setEdit] = useState(false); const [txt, setTxt] = useState(''); const [email, setEmail] = useState(''); const [busy, setBusy] = useState(false); const [msg, setMsg] = useState(''); const [corr, setCorr] = useState(''); const [prop, setProp] = useState(''); const [cbusy, setCbusy] = useState(false)
-  const load = async () => { const [a, b] = await Promise.all([supabase.from('project_chapters').select('*').eq('project_id', id).order('position'), supabase.from('project_sections').select('*').eq('project_id', id).order('position')]); setChs(a.data ?? []); setSecs(b.data ?? []); if (!sel && b.data?.length) setSel(b.data[0].id) }
+  const { id, p } = useProject()
+  const [chs, setChs] = useState<Row[]>([]), [secs, setSecs] = useState<Row[]>([]), [sel, setSel] = useState('')
+  const [modal, setModal] = useState<null | 'edit' | 'correct' | 'scan' | 'toc'>(null)
+  const [txt, setTxt] = useState(''), [corr, setCorr] = useState(''), [prop, setProp] = useState(''), [email, setEmail] = useState('')
+  const [busy, setBusy] = useState(false), [msg, setMsg] = useState('')
+  const [img, setImg] = useState<{ data: string; mime: string } | null>(null), [sc, setSc] = useState<any>(null), [sbusy, setSbusy] = useState(false)
+  const fileRef = useRef<HTMLInputElement>(null), docRef = useRef<HTMLDivElement>(null)
+
+  const load = async () => {
+    const [a, b] = await Promise.all([supabase.from('project_chapters').select('*').eq('project_id', id).order('position'), supabase.from('project_sections').select('*').eq('project_id', id).order('position')])
+    setChs(a.data ?? []); setSecs(b.data ?? []); if (!sel && b.data?.length) setSel(b.data[0].id)
+  }
   useEffect(() => { load(); supabase.auth.getUser().then(({ data }) => setEmail(data.user?.email ?? '')) }, [id])
-  const s = secs.find(x => x.id === sel); useEffect(() => { setTxt(s?.content ?? ''); setEdit(false); setProp('') }, [sel, s?.content])
-  async function save() { await supabase.from('project_sections').update({ content: txt, user_edited: true, updated_at: new Date().toISOString() }).eq('id', sel); setMsg('Saved'); await load(); setEdit(false) }
-  async function regen() { if (!s) return; if (s.user_edited && !confirm('You edited this section. Regenerating will replace your changes. Continue?')) return; setBusy(true); const r = await callAI({ action: 'generate_section', projectId: id, sectionId: sel }); if (r.ok) await supabase.from('project_sections').update({ user_edited: false }).eq('id', sel); setMsg(r.ok ? 'Regenerated' : r.error); await load(); setBusy(false) }
-  async function askCorrection() { if (!s || !corr.trim()) return; setCbusy(true); setMsg(''); const r = await callAI({ action: 'correct_section', projectId: id, sectionId: sel, instruction: corr }); setCbusy(false); if (r.ok) setProp(r.text); else setMsg(r.error ?? 'Could not apply the correction. Please try again.') }
-  async function applyCorrection() { await supabase.from('project_sections').update({ previous_content: s?.content, content: prop, user_edited: true, updated_at: new Date().toISOString() }).eq('id', sel); setProp(''); setCorr(''); setMsg('Correction applied'); await load() }
-  async function undo() { if (!s?.previous_content) return; await supabase.from('project_sections').update({ content: s.previous_content, previous_content: null }).eq('id', sel); setMsg('Previous version restored'); await load() }
+
+  const idx = secs.findIndex(x => x.id === sel); const s = secs[idx]; const ch = chs.find(c => c.id === s?.chapter_id)
+  const label = (x: Row) => `${chs.find(c => c.id === x.chapter_id)?.position}.${secs.filter(y => y.chapter_id === x.chapter_id).indexOf(x) + 1} ${x.heading}`
+  const close = () => { setModal(null); setProp(''); setSc(null); setSbusy(false) }
+  const go = (d: number) => { const n = secs[idx + d]; if (n) { setSel(n.id); setMsg(''); docRef.current?.scrollTo({ top: 0 }) } }
   const block = (e: { preventDefault: () => void }) => e.preventDefault()
-  return <Shell id={id} p={p}><div className="flex flex-col gap-4 lg:h-[calc(100vh-2.5rem)] lg:flex-row"><aside className="rounded-xl border border-line bg-white p-3 lg:w-64 lg:shrink-0 lg:overflow-y-auto">{chs.map(c => <div key={c.id} className="mb-3"><p className="mt-1 text-xs font-bold uppercase tracking-wide text-ink/60">Chapter {c.position}: {c.title}</p>{secs.filter(x => x.chapter_id === c.id).map((x, j) => <button key={x.id} onClick={() => setSel(x.id)} className={`block w-full rounded px-2 py-1 text-left text-sm ${sel === x.id ? 'bg-gold/20 font-semibold' : 'hover:bg-ink/5'}`}>{c.position}.{j + 1} {x.heading} {x.status !== 'completed' && <i className="text-xs">({x.status})</i>}</button>)}</div>)}</aside>
-    <section className="min-w-0 flex-1 lg:overflow-y-auto lg:pr-2">{!s ? <p>No sections yet. <Link className="underline" to={`/projects/${id}/generate`}>Generate your project</Link>.</p> : <>
-      <h2 className="font-display text-xl font-semibold">{s.heading}</h2>
-      <div className="my-3 flex flex-wrap gap-2">{!edit ? <button className="btn-ghost !py-1.5" onClick={() => setEdit(true)}>Edit</button> : <><button className="btn-primary !py-1.5" onClick={save}>Save changes</button><button className="btn-ghost !py-1.5" onClick={() => setEdit(false)}>Cancel</button></>}<button className="btn-ghost !py-1.5" disabled={busy} onClick={regen}>{busy ? 'Regenerating…' : 'Regenerate section'}</button>{msg && <span className="self-center text-sm">{msg}</span>}</div>
-      {edit ? <textarea className="input" rows={20} value={txt} onChange={e => setTxt(e.target.value)} /> :
-        <div className="relative select-none overflow-hidden rounded-xl border border-ink/10 bg-white p-6 leading-7" onContextMenu={block} onCopy={block} onCut={block} onDragStart={block}>
-          <div aria-hidden className="pointer-events-none absolute inset-0 flex items-center justify-center text-3xl font-bold text-ink/5 -rotate-12">{email}</div>
-          <div className="relative whitespace-pre-wrap">{clean(s.content || 'Not written yet.')}</div></div>}
-      <div className="mt-6 rounded-xl border border-line bg-white p-4"><h3 className="font-semibold">Lecturer correction</h3><p className="text-sm text-ink/60">Type what your lecturer wrote about this section. The AI changes only what is needed, and you approve the result before it is saved.</p>
-        <textarea className="input mt-3" rows={3} placeholder="e.g. Add more recent studies and explain the problem more clearly" value={corr} onChange={e => setCorr(e.target.value)} />
-        <div className="mt-2 flex flex-wrap gap-2"><button className="btn-gold !py-1.5" disabled={cbusy || !corr.trim()} onClick={askCorrection}>{cbusy ? 'Applying…' : 'Apply correction'}</button>{s.previous_content && <button className="btn-ghost !py-1.5" onClick={undo}>Restore previous version</button>}</div>
-        {prop && <div className="mt-3 rounded-lg border border-gold bg-gold/5 p-3"><p className="text-sm font-semibold">Corrected version (preview)</p><div className="mt-2 whitespace-pre-wrap text-sm">{prop}</div><div className="mt-3 flex gap-2"><button className="btn-primary !py-1.5" onClick={applyCorrection}>Keep this version</button><button className="btn-ghost !py-1.5" onClick={() => setProp('')}>Discard</button></div></div>}</div>
-      <p className="mt-2 text-xs text-ink/50">Copy protection only discourages casual copying. Screenshots and other tools can still capture this text.</p></>}</section></div></Shell>
+
+  async function save() { if (!s) return; await supabase.from('project_sections').update({ previous_content: s.content, content: txt, user_edited: true, updated_at: new Date().toISOString() }).eq('id', sel); setMsg('Saved'); close(); await load() }
+  async function regen() {
+    if (!s) return; if (s.user_edited && !confirm('You edited this section. Regenerating will replace your changes. Continue?')) return
+    setBusy(true); setMsg(''); const r = await callAI({ action: 'generate_section', projectId: id, sectionId: sel })
+    if (r.ok) await supabase.from('project_sections').update({ user_edited: false }).eq('id', sel)
+    setMsg(r.ok ? 'Section regenerated' : r.error ?? 'Could not regenerate. Please try again.'); await load(); setBusy(false)
+  }
+  async function askCorrection() { if (!s || !corr.trim()) return; setBusy(true); const r = await callAI({ action: 'correct_section', projectId: id, sectionId: sel, instruction: corr }); setBusy(false); if (r.ok) setProp(r.text); else setMsg(r.error ?? 'Could not apply the correction. Please try again.') }
+  async function applyCorrection() { await supabase.from('project_sections').update({ previous_content: s?.content, content: prop, user_edited: true, updated_at: new Date().toISOString() }).eq('id', sel); setMsg('Correction applied'); setCorr(''); close(); await load() }
+  async function undo() { if (!s?.previous_content) return; await supabase.from('project_sections').update({ content: s.previous_content, previous_content: null }).eq('id', sel); setMsg('Previous version restored'); await load() }
+  async function runScan(im: { data: string; mime: string }, force?: number) {
+    setSbusy(true); setSc(null); const r = await callAI({ action: 'scan_correction', projectId: id, image: im.data, mime: im.mime, forceSection: force }); setSbusy(false)
+    if (!r.ok) return setSc({ error: r.error ?? 'Could not read the page. Please try a clearer photo.' })
+    setSc(r); if (r.sectionId) setSel(r.sectionId)
+  }
+  async function onFile(f: File) { setModal('scan'); setSc(null); try { const im = await toJpeg(f); setImg(im); await runScan(im) } catch { setSc({ error: 'That file could not be read as a photo. Please try another one.' }) } }
+  async function applyScan() { const t = secs.find(x => x.id === sc.sectionId); await supabase.from('project_sections').update({ previous_content: t?.content, content: sc.text, user_edited: true, updated_at: new Date().toISOString() }).eq('id', sc.sectionId); setMsg('Correction applied to ' + sc.label); close(); await load() }
+
+  const toc = (done: () => void) => chs.map(c => (
+    <div key={c.id} className="mb-3">
+      <p className="mb-1 text-xs font-bold uppercase tracking-wide text-ink/60">Chapter {c.position}: {c.title}</p>
+      {secs.filter(x => x.chapter_id === c.id).map((x, j) => (
+        <button key={x.id} onClick={() => { setSel(x.id); setMsg(''); done() }} className={`block w-full rounded-lg px-3 py-2 text-left text-sm ${sel === x.id ? 'bg-gold/20 font-semibold' : 'hover:bg-ink/5'}`}>
+          {c.position}.{j + 1} {x.heading}{x.status !== 'completed' && <i className="ml-1 text-xs text-ink/50">({x.status})</i>}
+        </button>))}
+    </div>))
+  const sm = 'btn-ghost !px-3 !py-2 text-sm'
+
+  return (
+    <Shell id={id} p={p} wide extra={toc}>
+      <div className="flex flex-col gap-4 lg:h-[calc(100vh-3rem)]">
+        <section className="flex min-w-0 flex-1 flex-col lg:min-h-0">
+          {!s ? <p>No sections yet. <Link className="underline" to={`/projects/${id}/generate`}>Generate your project</Link>.</p> : <>
+            <div className="mb-3 flex items-start justify-between gap-3">
+              <div className="min-w-0"><p className="text-xs font-semibold uppercase tracking-wide text-ink/60">{ch ? `Chapter ${ch.position}: ${ch.title}` : ''}</p><h2 className="font-display text-xl font-semibold">{label(s)}</h2></div>
+            </div>
+            <div className="mb-3 flex flex-wrap gap-2">
+              <button className={sm} onClick={() => { setTxt(s.content ?? ''); setModal('edit') }}>Edit</button>
+              <button className={sm} disabled={busy} onClick={regen}>{busy ? 'Working…' : 'Regenerate'}</button>
+              <button className={sm} onClick={() => setModal('correct')}>Lecturer note</button>
+              <button className={sm} onClick={() => fileRef.current?.click()}>Scan page</button>
+              <button className={sm} onClick={() => exportSectionPdf(label(s), s.content ?? '')}>PDF</button>
+              <button className={sm} onClick={() => exportSectionDocx(label(s), s.content ?? '')}>DOCX</button>
+              {s.previous_content && <button className={sm} onClick={undo}>Undo</button>}
+            </div>
+            {msg && <p role="status" className="mb-2 text-sm text-ink/70">{msg}</p>}
+            <div ref={docRef} className="relative min-h-[45vh] select-none overflow-y-auto rounded-xl border border-line bg-white p-5 leading-7 sm:p-8 lg:min-h-0 lg:flex-1" onContextMenu={block} onCopy={block} onCut={block} onDragStart={block}>
+              <div aria-hidden className="pointer-events-none absolute inset-0 flex items-center justify-center overflow-hidden text-2xl font-bold text-ink/5 -rotate-12 sm:text-3xl">{email}</div>
+              <div className="relative whitespace-pre-wrap">{clean(s.content || 'Not written yet.')}</div>
+            </div>
+            <div className="mt-3 flex items-center justify-between gap-2">
+              <button className={sm} disabled={idx <= 0} onClick={() => go(-1)}>← Previous</button>
+              <span className="text-xs text-ink/50">{idx + 1} of {secs.length}</span>
+              <button className={sm} disabled={idx >= secs.length - 1} onClick={() => go(1)}>Next →</button>
+            </div>
+            <p className="mt-2 text-xs text-ink/50">Copy protection only discourages casual copying. Screenshots and other tools can still capture this text.</p>
+          </>}
+        </section>
+      </div>
+
+      <input ref={fileRef} type="file" accept="image/*" className="hidden" onChange={e => { const f = e.target.files?.[0]; if (f) onFile(f); e.target.value = '' }} />
+
+      {modal === 'edit' && s && <Modal title={`Edit ${label(s)}`} onClose={close}>
+        <textarea className="input min-h-[50vh] resize-y leading-7" value={txt} onChange={e => setTxt(e.target.value)} autoFocus />
+        <p className="mt-2 text-xs text-ink/50">{txt.trim() ? txt.trim().split(/\s+/).length : 0} words</p>
+        <div className="mt-4 flex justify-end gap-2"><button className="btn-ghost" onClick={close}>Cancel</button><button className="btn-primary" onClick={save}>Save changes</button></div>
+      </Modal>}
+
+      {modal === 'correct' && s && <Modal title="Lecturer note" onClose={close}>
+        {!prop ? <>
+          <p className="text-sm text-ink/60">Type what your lecturer wrote about <b>{label(s)}</b>. The AI changes only what is needed, and you check it before it is saved.</p>
+          <textarea className="input mt-3 min-h-[30vh] resize-y" placeholder="e.g. Add more recent studies and explain the problem more clearly" value={corr} onChange={e => setCorr(e.target.value)} autoFocus />
+          <div className="mt-4 flex justify-end gap-2"><button className="btn-ghost" onClick={close}>Cancel</button><button className="btn-gold" disabled={busy || !corr.trim()} onClick={askCorrection}>{busy ? 'Applying…' : 'Apply correction'}</button></div>
+        </> : <>
+          <p className="text-sm font-semibold">Corrected version (preview)</p>
+          <div className="mt-2 max-h-[50vh] overflow-y-auto whitespace-pre-wrap rounded-lg border border-gold bg-gold/5 p-3 text-sm leading-6">{prop}</div>
+          <div className="mt-4 flex flex-wrap justify-end gap-2"><button className="btn-ghost" onClick={() => setProp('')}>Back</button><button className="btn-ghost" onClick={() => exportSectionPdf(label(s), prop)}>PDF</button><button className="btn-ghost" onClick={() => exportSectionDocx(label(s), prop)}>DOCX</button><button className="btn-primary" onClick={applyCorrection}>Keep this version</button></div>
+        </>}
+      </Modal>}
+
+      {modal === 'scan' && <Modal title="Scan a marked page" onClose={close}>
+        {sbusy && <p className="text-sm">Reading the page and applying the corrections… this can take up to a minute.</p>}
+        {sc?.error && <><p role="alert" className="text-sm text-red-700">{sc.error}</p><div className="mt-4 flex justify-end gap-2"><button className="btn-ghost" onClick={close}>Close</button><button className="btn-primary" onClick={() => fileRef.current?.click()}>Try another photo</button></div></>}
+        {sc?.needsSection && <><p className="text-sm">I could not tell which section this page belongs to. Please choose it:</p>
+          <select className="input mt-3" defaultValue="" onChange={e => img && runScan(img, Number(e.target.value))}><option value="" disabled>Choose the section</option>{sc.sections.map((x: any) => <option key={x.index} value={x.index}>{x.label}</option>)}</select></>}
+        {sc?.noComments && <><p className="text-sm text-amber-800">This page matches <b>{sc.label}</b>, but I could not read any corrections on it.</p><div className="mt-4 flex justify-end gap-2"><button className="btn-primary" onClick={() => setModal('correct')}>Type the correction instead</button></div></>}
+        {sc?.text && <>
+          <p className="text-sm font-semibold">Found: {sc.label}{sc.confidence === 'low' ? ' (not sure, please check)' : ''}</p>
+          <p className="mt-3 text-sm font-semibold">Corrections I read</p>
+          <ul className="ml-5 list-disc text-sm">{sc.comments.map((c: string, i: number) => <li key={i}>{c}</li>)}</ul>
+          <p className="mt-3 text-sm font-semibold">Corrected version (preview)</p>
+          <div className="mt-1 max-h-[35vh] overflow-y-auto whitespace-pre-wrap rounded-lg border border-gold bg-gold/5 p-3 text-sm leading-6">{sc.text}</div>
+          <label className="mt-3 block text-sm">Wrong section?
+            <select className="input mt-1" defaultValue="" onChange={e => img && runScan(img, Number(e.target.value))}><option value="" disabled>Change section</option>{secs.map((x, i) => <option key={x.id} value={i}>{label(x)}</option>)}</select></label>
+          <div className="mt-4 flex flex-wrap justify-end gap-2"><button className="btn-ghost" onClick={close}>Discard</button><button className="btn-ghost" onClick={() => exportSectionPdf(sc.label, sc.text)}>PDF</button><button className="btn-ghost" onClick={() => exportSectionDocx(sc.label, sc.text)}>DOCX</button><button className="btn-primary" onClick={applyScan}>Keep this version</button></div>
+        </>}
+      </Modal>}
+    </Shell>)
 }
 
 export function Sources() {

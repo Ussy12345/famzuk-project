@@ -4,7 +4,7 @@ import { createClient } from '@supabase/supabase-js'
 import dns from 'node:dns'
 dns.setDefaultResultOrder('ipv4first')
 
-type Opts = { json?: boolean; search?: boolean }
+type Opts = { json?: boolean; search?: boolean; image?: { mime: string; data: string } }
 
 // Central Gemini service layer (server-side only). search=true turns on Google Search grounding.
 async function gemini(prompt: string, system: string, o: Opts = {}): Promise<string> {
@@ -19,7 +19,7 @@ async function gemini(prompt: string, system: string, o: Opts = {}): Promise<str
       headers: { 'Content-Type': 'application/json', 'x-goog-api-key': process.env.GEMINI_API_KEY as string },
       body: JSON.stringify({
         systemInstruction: { parts: [{ text: system }] },
-        contents: [{ role: 'user', parts: [{ text: prompt }] }],
+        contents: [{ role: 'user', parts: [{ text: prompt }, ...(o.image ? [{ inline_data: { mime_type: o.image.mime, data: o.image.data } }] : [])] }],
         ...(o.search ? { tools: [{ google_search: {} }] } : {}),
         ...(o.json ? { generationConfig: { responseMimeType: 'application/json' } } : {}),
       }),
@@ -216,6 +216,28 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         await db.from('project_sections').update({ status: 'failed' }).eq('id', sectionId)
         throw e
       }
+    }
+    if (action === 'scan_correction') {
+      const { image, mime, forceSection } = req.body ?? {}
+      if (!image || String(image).length > 9000000) return res.status(400).json({ error: 'The photo is missing or too large. Please take a clearer, smaller photo.' })
+      const { data: chs } = await db.from('project_chapters').select('id,position,title').eq('project_id', projectId).order('position')
+      const { data: secs } = await db.from('project_sections').select('id,chapter_id,heading,content,position').eq('project_id', projectId).order('position')
+      const byId = new Map((chs ?? []).map((c: any) => [c.id, c])); const cnt: Record<string, number> = {}
+      const rows = (secs ?? []).map((x: any) => { const c: any = byId.get(x.chapter_id); cnt[x.chapter_id] = (cnt[x.chapter_id] ?? 0) + 1; return { ...x, label: `${c?.position}.${cnt[x.chapter_id]} ${x.heading}`, chap: `Chapter ${c?.position}: ${c?.title}` } })
+      const list = rows.map((x: any, i: number) => `#${i} | ${x.chap} | ${x.label} | starts: ${String(x.content ?? '').replace(/\s+/g, ' ').slice(0, 160)}`).join('\n')
+      const raw = await gemini(`This is a photo of a printed university project page that a lecturer marked with handwritten corrections.\nSECTIONS OF THE STUDENT'S PROJECT:\n${list}\n\nDo two things.\n1) Decide which section the printed text belongs to by matching the printed words, headings and numbers. Use -1 if you cannot tell.\n2) Read every handwritten or marked correction and list each one, quoting the lecturer's words and saying where it applies. If a note cannot be read, write "[unreadable]" for it. Never guess.\nReply ONLY with JSON: {"sectionIndex":0,"confidence":"high|medium|low","comments":["..."]}`, 'You read marked-up university project pages. Reply with JSON only.', { json: true, image: { mime: mime || 'image/jpeg', data: image } })
+      let j: any = {}; try { j = JSON.parse(raw.slice(raw.indexOf('{'), raw.lastIndexOf('}') + 1)) } catch { /* handled below */ }
+      const comments: string[] = Array.isArray(j.comments) ? j.comments.map(String) : []
+      let idx = Number.isInteger(forceSection) ? forceSection : Number.isInteger(j.sectionIndex) ? j.sectionIndex : -1
+      if (idx < 0 || idx >= rows.length) return res.json({ ok: true, needsSection: true, comments, sections: rows.map((x: any, i: number) => ({ index: i, label: `${x.chap} — ${x.label}` })) })
+      const sec: any = rows[idx]
+      const readable = comments.filter(c => !/unreadable/i.test(c))
+      if (!readable.length) return res.json({ ok: true, noComments: true, sectionId: sec.id, label: sec.label, comments })
+      const { data: src } = await db.from('project_sources').select('citation,abstract').eq('project_id', projectId).neq('provenance', 'ai_generated')
+      const picked = pickRefs(src ?? [], `${project.topic} ${sec.heading} ${readable.join(' ')}`, 12)
+      const refList = picked.map((x: any, i: number) => `[${i + 1}] ${String(x.citation).replace(/https?:\/\/\S+/g, '').trim()}\nABSTRACT: ${String(x.abstract || 'not available').slice(0, 450)}`).join('\n\n')
+      const out = await gemini(`Topic: ${project.topic}\nSection "${sec.heading}" currently reads:\n${sec.content}\n\nLECTURER CORRECTIONS read from the marked page:\n${readable.map((c, i) => `${i + 1}. ${c}`).join('\n')}\n\nRewrite the section applying these corrections. Change only what is needed and keep everything else. Keep the citation style. ${CITE_LOOSE}\nSOURCES:\n${refList}`, RULES, { search: true })
+      return res.json({ ok: true, sectionId: sec.id, label: sec.label, confidence: j.confidence ?? 'medium', comments, text: fixCitations(clean(out), picked).text })
     }
     if (action === 'correct_section') {
       const instruction = String(req.body?.instruction ?? '').slice(0, 4000)
