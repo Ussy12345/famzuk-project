@@ -108,7 +108,7 @@ export function Generate() {
       const r = await callAI({ action: 'generate_section', projectId: id, sectionId: s.id })
       if (r.auth || /out of quota/i.test(r.error ?? '')) stop.current = true
       if (r.ok) { n0++; setEta(Math.round(((Date.now() - t0) / 1000 / n0) * (all.filter(x => x.status !== 'completed').length - 1))); await supabase.from('project_generation_jobs').update({ status: 'completed', completed_at: new Date().toISOString() }).eq('section_id', s.id) }
-      else { await supabase.from('project_generation_jobs').update({ status: 'failed', error: r.error }).eq('section_id', s.id); if (tries[s.id] >= 3) gaveUp.add(s.id); setAct(r.error ?? 'Retrying…'); await sleep(/Rate|internet|Network/i.test(r.error ?? '') ? 30000 : 3000) }
+      else { await supabase.from('project_generation_jobs').update({ status: 'failed', error: r.error }).eq('section_id', s.id); if (tries[s.id] >= 3) gaveUp.add(s.id); setAct(r.error ?? 'Retrying…'); await sleep(/Rate|internet|Network|unexpected/i.test(r.error ?? '') ? 30000 : 3000) }
       await sleep(1500)
     }
     const fin = await load(); await supabase.from('projects').update({ status: fin.every(x => x.status === 'completed') ? 'review' : 'failed' }).eq('id', id); setRun(false); setAct(''); reload()
