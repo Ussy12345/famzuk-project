@@ -5,7 +5,7 @@ async function post(body: Record<string, unknown>, token?: string) {
   const r = await fetch('/api/ai', { method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` }, body: JSON.stringify(body) })
   const t = await r.text()
   let j: any
-  try { j = JSON.parse(t) } catch { j = { error: `The server sent an unexpected reply (HTTP ${r.status}). It may be waking up, so please wait a moment and retry.` } }
+  try { j = JSON.parse(t) } catch { j = { error: r.status === 200 ? 'The AI service is not running on this server. Please contact support.' : `The server sent an unexpected reply (HTTP ${r.status}). It may be waking up, so please wait a moment and retry.` } }
   return { status: r.status, j }
 }
 
