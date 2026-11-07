@@ -1,0 +1,307 @@
+import './net'
+import type { VercelRequest, VercelResponse } from '@vercel/node'
+import { createClient } from '@supabase/supabase-js'
+import dns from 'node:dns'
+dns.setDefaultResultOrder('ipv4first')
+
+type Opts = { json?: boolean; search?: boolean; image?: { mime: string; data: string } }
+
+// Central Gemini service layer (server-side only). search=true turns on Google Search grounding.
+async function gemini(prompt: string, system: string, o: Opts = {}): Promise<string> {
+  const models = [process.env.GEMINI_MODEL || 'gemini-3.5-flash-lite', process.env.GEMINI_FALLBACK_MODEL, process.env.GEMINI_FALLBACK_MODEL_2 || 'gemini-flash-latest'].filter(Boolean) as string[]
+  let last = ''
+  for (let i = 0; i < 6; i++) {
+    const model = models[i % models.length]
+    let r: Response
+    try { r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`, {
+      signal: AbortSignal.timeout(o.search ? 120000 : 60000),
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-goog-api-key': process.env.GEMINI_API_KEY as string },
+      body: JSON.stringify({
+        systemInstruction: { parts: [{ text: system }] },
+        contents: [{ role: 'user', parts: [{ text: prompt }, ...(o.image ? [{ inline_data: { mime_type: o.image.mime, data: o.image.data } }] : [])] }],
+        ...(o.search ? { tools: [{ google_search: {} }] } : {}),
+        ...(o.json ? { generationConfig: { responseMimeType: 'application/json' } } : {}),
+      }),
+    }) } catch (e) { last = 'network: ' + String((e as any)?.cause?.code || e); console.warn(`Gemini retry ${i + 1}/6 -> ${last}`); await new Promise(res => setTimeout(res, 4000 * (i + 1))); continue }
+    if (r.ok) {
+      const j = await r.json()
+      const t = j.candidates?.[0]?.content?.parts?.map((p: { text?: string }) => p.text ?? '').join('') ?? ''
+      if (t.trim()) return t
+      last = `empty reply from ${model}`
+    } else {
+      const body = await r.text()
+      last = `${r.status} ${model} search=${!!o.search}: ${body.slice(0, 220).replace(/\s+/g, ' ')}`
+      if (r.status === 429 && o.search && /quota|RESOURCE_EXHAUSTED/i.test(body)) { if (process.env.TAVILY_API_KEY) { const ctx = await webContext(prompt); o.search = false; return gemini(ctx ? prompt + '\n\nWEB SEARCH RESULTS (use these for current facts and structure, do not invent anything beyond them):\n' + ctx : prompt, system, o) } if (process.env.REQUIRE_SEARCH !== 'false') throw Object.assign(new Error('search_quota'), { code: 'search_quota' }); console.warn('Search quota exhausted; continuing without Google Search'); o.search = false; return gemini(prompt, system, o) }
+      if (![429, 500, 502, 503, 504].includes(r.status)) throw new Error(`gemini_${last}`)
+      const m = body.match(/"retryDelay":\s*"(\d+)/)
+      var wait = Math.min(25, m ? Number(m[1]) + 1 : 3 * (i + 1))
+    }
+    console.warn(`Gemini retry ${i + 1}/6 -> ${last}`)
+    await new Promise(res => setTimeout(res, (wait || 3) * 1000))
+  }
+  throw Object.assign(new Error('busy: ' + last), { code: 429 })
+}
+
+async function webContext(prompt: string): Promise<string> {
+  const topic = prompt.match(/Topic: (.+)/)?.[1] ?? ''
+  const heading = prompt.match(/section "(.+?)"/)?.[1] ?? 'structure of project chapters'
+  try {
+    const r = await fetch('https://api.tavily.com/search', { method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${process.env.TAVILY_API_KEY}` }, body: JSON.stringify({ query: `${topic} ${heading}`.slice(0, 300), max_results: 6 }), signal: AbortSignal.timeout(30000) })
+    if (!r.ok) return ''
+    const j = await r.json()
+    return (j.results ?? []).map((x: any) => `- ${x.title} (${x.url}): ${String(x.content).slice(0, 400)}`).join('\n')
+  } catch { return '' }
+}
+
+function clean(t: string): string {
+  return t.replace(/\r/g, '').replace(/^#{1,6}\s*/gm, '').replace(/^\s*[*-]\s+/gm, '• ').replace(/\*\*(.+?)\*\*/g, '$1').replace(/__(.+?)__/g, '$1').replace(/\*(?!\s)([^*\n]+?)\*/g, '$1').replace(/`/g, '').replace(/\n{3,}/g, '\n\n').trim()
+}
+
+const RULES = `Write in simple, clear academic English. Use plain text only: no markdown, no asterisks, no # headings, no bold or italics. Do not repeat the section title. Write normal paragraphs. NEVER invent references, authors, DOIs, statistics or research results. If real data is missing write "[Student research data required here]".`
+
+// Checks a reference line's link. Dead and DOI links are dropped.
+async function checkLink(line: string): Promise<'verified' | 'unverified' | 'dead'> {
+  const url = line.match(/https?:\/\/[^\s<>)\]]+/)?.[0]?.replace(/[.,;]+$/, '')
+  if (!url || /doi\.org/i.test(url)) return 'dead'
+  try {
+    const r = await fetch(url, { redirect: 'follow', signal: AbortSignal.timeout(8000), headers: { 'User-Agent': 'Mozilla/5.0 FamzukProjects' } })
+    if ([401, 403, 429].includes(r.status)) return 'unverified'
+    if (!r.ok) return 'dead'
+    const body = (await r.text()).slice(0, 300000).toLowerCase()
+    const surname = line.split(',')[0].trim().toLowerCase()
+    return surname.length > 1 && body.includes(surname) ? 'verified' : 'unverified'
+  } catch { return 'dead' }
+}
+
+function parseRefs(text: string): string[] {
+  return text.split('\n').map(l => l.replace(/^\s*(\d+[.)]|[-•*])\s*/, '').trim()).filter(l => l.length > 40 && /\(20(2[0-5])\)/.test(l) && /https?:\/\//.test(l))
+}
+
+const CITE_STRICT = `CITATION RULES: every paragraph MUST end with one or two in-text citations taken only from the SOURCES list, written (Surname, Year) for one author, (Surname & Surname, Year) for two, and (Surname et al., Year) for three or more. Cite a source ONLY for a statement its abstract supports. If no source supports a statement, leave that statement out. Never cite anything that is not in the list.`
+const CITE_LOOSE = `CITATION RULES: cite from the SOURCES list only where a statement is supported by that source's abstract, using (Surname, Year), (Surname & Surname, Year) or (Surname et al., Year). Never cite anything not in the list.`
+
+function pickRefs(src: any[], q: string, n: number) {
+  const words = q.toLowerCase().split(/\W+/).filter(w => w.length > 3)
+  return src.map(x => ({ x, sc: words.reduce((a, w) => a + ((x.citation + ' ' + (x.abstract ?? '')).toLowerCase().includes(w) ? 1 : 0), 0) })).sort((a, b) => b.sc - a.sc).slice(0, n).map(o => o.x)
+}
+function fixCitations(text: string, refs: any[]) {
+  const allowed = refs.map(r => ({ sur: String(r.citation).split(',')[0].trim().toLowerCase(), yr: String(r.citation).match(/\((\d{4})[a-z]?\)/)?.[1] }))
+  const valid = (c: string) => { const y = c.match(/(\d{4})/)?.[1]; const first = c.split(/[,&]| et al/)[0].trim().toLowerCase(); return allowed.some(a => a.yr === y && a.sur === first) }
+  let bad = 0
+  const out = text.replace(/\(([A-Z][^()]*?\d{4}[a-z]?)\)/g, (m, inner: string) => {
+    const parts = inner.split(';').map(x => x.trim()); const good = parts.filter(valid)
+    if (good.length === parts.length) return m
+    bad += parts.length - good.length
+    return good.length ? `(${good.join('; ')})` : ''
+  })
+  return { text: out.replace(/ +\./g, '.').replace(/ {2,}/g, ' '), ok: bad === 0 }
+}
+function checkText(t: string, refs: any[], strict: boolean) {
+  const f = fixCitations(t, refs)
+  const missing = strict ? f.text.split(/\n\n+/).filter(p => p.trim().length > 60 && !/\([A-Z][^()]*\d{4}[a-z]?\)[.]?$/.test(p.trim())).length : 0
+  return { text: f.text, ok: f.ok, missing }
+}
+function abstractOf(w: any): string {
+  const ix = w.abstract_inverted_index; if (!ix) return ''
+  const words: string[] = []
+  for (const [word, pos] of Object.entries(ix as Record<string, number[]>)) for (const p of pos) words[p] = word
+  return words.filter(Boolean).join(' ').slice(0, 1200)
+}
+
+function apaName(n: string) { const p = n.replace(/\./g, '').trim().split(/\s+/); if (p.length < 2) return n; return `${p[p.length - 1]}, ${p.slice(0, -1).map(x => x[0].toUpperCase() + '.').join(' ')}` }
+function toApa(w: any): string | null {
+  const auth: string[] = (w.authorships ?? []).map((a: any) => a.author?.display_name).filter(Boolean).slice(0, 20).map(apaName)
+  const loc = w.primary_location ?? {}
+  const url = [w.open_access?.oa_url, loc.landing_page_url].find((u: string) => u && !/doi\.org/i.test(u))
+  const title = String(w.title ?? '').replace(/<[^>]+>/g, '').replace(/\.$/, '').trim()
+  if (!auth.length || !title || !w.publication_year || !url) return null
+  const who = auth.length === 1 ? auth[0] : auth.slice(0, -1).join(', ') + ', & ' + auth[auth.length - 1]
+  const b = w.biblio ?? {}, src = loc.source?.display_name
+  const vol = b.volume ? `, ${b.volume}` : '', iss = b.issue ? `(${b.issue})` : '', pg = b.first_page ? `, ${b.first_page}${b.last_page && b.last_page !== b.first_page ? '-' + b.last_page : ''}` : ''
+  return `${who} (${w.publication_year}). ${title}. ${src ? src + vol + iss + pg + '. ' : ''}${url}`
+}
+async function findReferences(db: any, project: Record<string, any>) {
+  const { data: have } = await db.from('project_sources').select('citation').eq('project_id', project.id)
+  const known = new Set((have ?? []).map((s: any) => s.citation))
+  if (known.size >= 30) return { added: 0, verified: 0 }
+  let queries: string[] = [project.topic]
+  try {
+    const t = await gemini(`Topic: ${project.topic}\nCourse: ${project.course_name}\nGive 6 short, different academic search queries (3-6 words each) for finding peer-reviewed papers on this topic. Reply ONLY with a JSON array of strings.`, 'You are a research librarian.', { json: true })
+    const q = JSON.parse(t.slice(t.indexOf('['), t.lastIndexOf(']') + 1))
+    if (Array.isArray(q) && q.length) queries = [project.topic, ...q.map(String)].slice(0, 7)
+  } catch { /* use the topic alone */ }
+  const pools: any[][] = await Promise.all(queries.map(q => fetch(`https://api.openalex.org/works?search=${encodeURIComponent(q)}&filter=from_publication_date:2020-01-01,to_publication_date:2025-12-31,type:article,has_abstract:true&per-page=15&mailto=projects@famzuk.app`, { signal: AbortSignal.timeout(15000) }).then(r => r.ok ? r.json() : { results: [] }).then(j => j.results ?? []).catch(() => [])))
+  const seen = new Set<string>(); const lines: string[] = []; const abs = new Map<string, string>()
+  for (let i = 0; i < 15; i++) for (const pool of pools) { const w = pool[i]; if (!w) continue; const key = String(w.title).toLowerCase(); const line = toApa(w); if (line && !seen.has(key) && !known.has(line)) { seen.add(key); lines.push(line); abs.set(line, abstractOf(w)) } }
+  const pick = lines.slice(0, 30 - known.size)
+  const results = await Promise.all(pick.map(checkLink))
+  const rows = pick.map((l, i) => ({ project_id: project.id, citation: l, abstract: abs.get(l) ?? null, provenance: results[i] === 'verified' ? 'verified' : 'needs_verification' }))
+  if (rows.length) await db.from('project_sources').insert(rows)
+  return { added: rows.length, verified: rows.filter(r => r.provenance === 'verified').length }
+}
+
+async function planProject(db: any, project: Record<string, any>) {
+  const o: Opts = { search: true }
+  const prompt = `Student project:\nTopic: ${project.topic}\nCourse: ${project.course_name}\nLevel: ${project.level}\nInstitution: ${project.institution}\nProject type: ${project.project_type}\nTarget length: about ${project.target_pages} pages.\n\nUse Google Search to confirm how real ${project.course_name} ${project.level} projects on this kind of topic are structured, which headings and methods are standard, and what the usual problem, aim and objectives are. Then reply with ONLY one JSON object, no markdown:\n{"memory":{"problem":"","aim":"","objectives":[],"researchQuestions":[],"targetUsers":"","proposedSolution":"","methodology":"","technologies":[],"features":[],"facts":[],"assumptions":[]},"chapters":[{"title":"Introduction","sections":["Background","Statement of the Problem","Objectives","Significance","Scope"]}]}\nStructure rules (follow this style exactly): five chapters titled Introduction; Literature Review; Materials and Methods (or Research Methodology, or System Analysis and Design, whichever fits the course); Results and Discussion (or Implementation and Testing); Conclusion and Recommendations. Chapter 1 sections are exactly: Background, Statement of the Problem, Objectives, Significance, Scope. Chapter 2 has 5 to 7 headings that name the real subject of THIS topic (example for a study on antioxidants in Momordica charantia: Overview of Medicinal Plants, Botanical Profile of Momordica charantia, Phytochemical Constituents, Oxidative Stress and Free Radicals, Antioxidant Mechanisms, Plant Extraction Principles). Chapter 3 lists the real methods or procedures for this topic. Chapter 4 has 4 to 6 result headings ending with Discussion. Chapter 5 sections: Summary, Conclusion, Recommendations. Headings are short and have no numbers. Never invent statistics or results.`
+  let plan: any
+  for (let i = 0; i < 2 && !plan; i++) {
+    try {
+      const t = await gemini(prompt, 'You are an experienced university project supervisor. Reply with JSON only.', o)
+      const j = JSON.parse(t.slice(t.indexOf('{'), t.lastIndexOf('}') + 1))
+      if (Array.isArray(j.chapters) && j.chapters.length >= 3) plan = j
+    } catch (e) { console.warn('plan retry', e) }
+  }
+  if (!plan) throw new Error('plan_failed')
+  await db.from('project_chapters').delete().eq('project_id', project.id)
+  await db.from('project_memory').upsert({ project_id: project.id, data: plan.memory ?? {} })
+  let pos = 0
+  for (const [i, c] of plan.chapters.entries()) {
+    const { data: ch } = await db.from('project_chapters').insert({ project_id: project.id, position: i + 1, title: String(c.title) }).select().single()
+    const rows = (c.sections as string[]).map(h => ({ project_id: project.id, chapter_id: ch!.id, position: ++pos, heading: String(h).replace(/^[\d.\s]+/, '') }))
+    const { data: secs } = await db.from('project_sections').insert(rows).select('id')
+    await db.from('project_generation_jobs').insert((secs ?? []).map((x: any) => ({ project_id: project.id, chapter_id: ch!.id, section_id: x.id })))
+  }
+  await db.from('projects').update({ status: 'ready' }).eq('id', project.id)
+  return !!o.search || !!process.env.TAVILY_API_KEY
+}
+
+export default async function handler(req: VercelRequest, res: VercelResponse) {
+  const db = createClient((process.env.SUPABASE_URL || process.env.VITE_SUPABASE_URL)!, process.env.SUPABASE_SERVICE_ROLE_KEY!)
+  const netErr = (e: any) => /fetch|retryable|network|timeout/i.test(String(e?.name) + String(e?.message))
+  const { data: u, error: ue } = await db.auth.getUser((req.headers.authorization || '').replace('Bearer ', ''))
+  if (!u?.user) return netErr(ue) ? res.status(503).json({ error: 'Network problem reaching the database. Please try again.' }) : res.status(401).json({ error: 'Unauthorized' })
+  const { action, projectId, sectionId } = req.body ?? {}
+  const { data: project, error: pe } = await db.from('projects').select('*').eq('id', projectId).eq('user_id', u.user.id).single()
+  if (!project) return pe && pe.code !== 'PGRST116' ? res.status(503).json({ error: 'Network problem reaching the database. Please try again.' }) : res.status(404).json({ error: 'Project not found' })
+  try {
+    if (action === 'interview') {
+      const { data: qa } = await db.from('project_questions').select('question,answer').eq('project_id', projectId).order('position')
+      const { data: course } = await db.from('course_profiles').select('*').eq('id', project.course_id).single()
+      const out = await gemini(
+        `Project: ${JSON.stringify(project)}\nCourse profile: ${JSON.stringify(course)}\nQ&A so far: ${JSON.stringify(qa)}\nIf you have enough information (3-7 questions total, usually 5), reply exactly DONE. Otherwise reply with ONE next question only.`,
+        'You interview a university student to build a project memory. ' + RULES)
+      if (out.trim() === 'DONE') {
+        const mem = await gemini(`Q&A: ${JSON.stringify(qa)}\nProject: ${JSON.stringify(project)}`, 'Return ONLY JSON with keys: problem, aim, objectives[], researchQuestions[], targetUsers, proposedSolution, methodology, technologies[], features[], facts[], assumptions[].', { json: true })
+        await db.from('project_memory').upsert({ project_id: projectId, data: JSON.parse(mem.replace(/```json|```/g, '')) })
+        await db.from('projects').update({ status: 'ready' }).eq('id', projectId)
+        return res.json({ done: true })
+      }
+      await db.from('project_questions').insert({ project_id: projectId, position: (qa?.length ?? 0) + 1, question: out.trim() })
+      return res.json({ done: false, question: out.trim() })
+    }
+    if (action === 'plan') { const searched = await planProject(db, project); return res.json({ ok: true, searched }) }
+    if (action === 'find_references') return res.json({ ok: true, ...(await findReferences(db, project)) })
+    if (action === 'generate_section') {
+      const { data: s } = await db.from('project_sections').select('*').eq('id', sectionId).eq('project_id', projectId).single()
+      const { data: ch } = await db.from('project_chapters').select('position').eq('id', s.chapter_id).single()
+      const { data: mem } = await db.from('project_memory').select('data').eq('project_id', projectId).single()
+      const { data: src } = await db.from('project_sources').select('citation,abstract').eq('project_id', projectId).neq('provenance', 'ai_generated')
+      const { count: nSec } = await db.from('project_sections').select('id', { count: 'exact', head: true }).eq('project_id', projectId)
+      const strict = (ch?.position ?? 9) <= 2
+      const perSection = Math.round((project.target_pages * 300) / Math.max(1, nSec ?? 40))
+      const eight = /^(background( of the study)?|statement of the problem)$/i.test(s.heading)
+      if (strict && (src?.length ?? 0) < 5) return res.status(400).json({ error: 'Find references first (Sources page). Chapters 1 and 2 need real citations.' })
+      await db.from('project_sections').update({ status: 'generating' }).eq('id', sectionId)
+      try {
+        const picked = pickRefs(src ?? [], `${project.topic} ${s.heading}`, 12)
+        const list = picked.map((x: any, i: number) => `[${i + 1}] ${String(x.citation).replace(/https?:\/\/\S+/g, '').trim()}\nABSTRACT: ${String(x.abstract || 'not available').slice(0, 450)}`).join('\n\n')
+        const shape = eight ? 'Write exactly 8 paragraphs of about 100 to 140 words each.' : `Write about ${perSection} words in short paragraphs.`
+        const prompt = `Project memory: ${JSON.stringify(mem?.data)}\nTopic: ${project.topic}\nSOURCES:\n${list}\n${strict ? CITE_STRICT : CITE_LOOSE}\nWrite section "${s.heading}". ${shape} Use Google Search for current facts; do not state any statistic you did not find.`
+        let r1 = checkText(clean(await gemini(prompt, RULES, { search: true })), picked, strict)
+        if (strict && (!r1.ok || r1.missing)) r1 = checkText(clean(await gemini(prompt + '\nFIX: your last draft had citations not in the list, or paragraphs without a citation. Every paragraph must end with a citation from the list.', RULES, { search: true })), picked, strict)
+        await db.from('project_sections').update({ content: r1.text, status: 'completed', updated_at: new Date().toISOString() }).eq('id', sectionId)
+        return res.json({ ok: true })
+      } catch (e) {
+        await db.from('project_sections').update({ status: 'failed' }).eq('id', sectionId)
+        throw e
+      }
+    }
+    if (action === 'scan_correction') {
+      const { image, mime, forceSection } = req.body ?? {}
+      if (!image || String(image).length > 9000000) return res.status(400).json({ error: 'The photo is missing or too large. Please take a clearer, smaller photo.' })
+      const { data: chs } = await db.from('project_chapters').select('id,position,title').eq('project_id', projectId).order('position')
+      const { data: secs } = await db.from('project_sections').select('id,chapter_id,heading,content,position').eq('project_id', projectId).order('position')
+      const byId = new Map((chs ?? []).map((c: any) => [c.id, c])); const cnt: Record<string, number> = {}
+      const rows = (secs ?? []).map((x: any) => { const c: any = byId.get(x.chapter_id); cnt[x.chapter_id] = (cnt[x.chapter_id] ?? 0) + 1; return { ...x, label: `${c?.position}.${cnt[x.chapter_id]} ${x.heading}`, chap: `Chapter ${c?.position}: ${c?.title}` } })
+      const list = rows.map((x: any, i: number) => `#${i} | ${x.chap} | ${x.label} | starts: ${String(x.content ?? '').replace(/\s+/g, ' ').slice(0, 160)}`).join('\n')
+      const raw = await gemini(`This is a photo of a printed university project page that a lecturer marked with handwritten corrections.\nSECTIONS OF THE STUDENT'S PROJECT:\n${list}\n\nDo two things.\n1) Decide which section the printed text belongs to by matching the printed words, headings and numbers. Use -1 if you cannot tell.\n2) Read every handwritten or marked correction and list each one, quoting the lecturer's words and saying where it applies. If a note cannot be read, write "[unreadable]" for it. Never guess.\nReply ONLY with JSON: {"sectionIndex":0,"confidence":"high|medium|low","comments":["..."]}`, 'You read marked-up university project pages. Reply with JSON only.', { json: true, image: { mime: mime || 'image/jpeg', data: image } })
+      let j: any = {}; try { j = JSON.parse(raw.slice(raw.indexOf('{'), raw.lastIndexOf('}') + 1)) } catch { /* handled below */ }
+      const comments: string[] = Array.isArray(j.comments) ? j.comments.map(String) : []
+      let idx = Number.isInteger(forceSection) ? forceSection : Number.isInteger(j.sectionIndex) ? j.sectionIndex : -1
+      if (idx < 0 || idx >= rows.length) return res.json({ ok: true, needsSection: true, comments, sections: rows.map((x: any, i: number) => ({ index: i, label: `${x.chap} — ${x.label}` })) })
+      const sec: any = rows[idx]
+      const readable = comments.filter(c => !/unreadable/i.test(c))
+      if (!readable.length) return res.json({ ok: true, noComments: true, sectionId: sec.id, label: sec.label, comments })
+      const { data: src } = await db.from('project_sources').select('citation,abstract').eq('project_id', projectId).neq('provenance', 'ai_generated')
+      const picked = pickRefs(src ?? [], `${project.topic} ${sec.heading} ${readable.join(' ')}`, 12)
+      const refList = picked.map((x: any, i: number) => `[${i + 1}] ${String(x.citation).replace(/https?:\/\/\S+/g, '').trim()}\nABSTRACT: ${String(x.abstract || 'not available').slice(0, 450)}`).join('\n\n')
+      const out = await gemini(`Topic: ${project.topic}\nSection "${sec.heading}" currently reads:\n${sec.content}\n\nLECTURER CORRECTIONS read from the marked page:\n${readable.map((c, i) => `${i + 1}. ${c}`).join('\n')}\n\nRewrite the section applying these corrections. Change only what is needed and keep everything else. Keep the citation style. ${CITE_LOOSE}\nSOURCES:\n${refList}`, RULES, { search: true })
+      return res.json({ ok: true, sectionId: sec.id, label: sec.label, confidence: j.confidence ?? 'medium', comments, text: fixCitations(clean(out), picked).text })
+    }
+    if (action === 'make_questionnaire') {
+      const { data: mem } = await db.from('project_memory').select('data').eq('project_id', projectId).single()
+      const t = await gemini(`Project topic: ${project.topic}\nCourse: ${project.course_name}\nLevel: ${project.level}\nProject memory: ${JSON.stringify(mem?.data)}\n\nCreate a questionnaire for this final year project. Reply with ONLY this JSON shape:\n{"intro":"","demographics":[{"label":"Gender","question":"What is your gender?","options":["Male","Female"]}],"sections":[{"title":"","objective":"","items":["statement"]}]}\nRules: 4 to 6 demographic questions with closed options that suit this topic and its respondents. 3 to 5 sections, one for each research objective in the project memory (if there are none, make them from the topic). Each section has 5 to 8 statements in simple English that respondents rate from Strongly Agree to Strongly Disagree. Statements are single ideas, not leading, with no numbering. The intro is two sentences that explain the purpose and that answers are confidential. The label is a short noun such as Gender, Age or Level of study.`, 'You design university survey questionnaires. Reply with JSON only.', { json: true })
+      let j: any; try { j = JSON.parse(t.slice(t.indexOf('{'), t.lastIndexOf('}') + 1)) } catch { j = null }
+      const okShape = j && Array.isArray(j.demographics) && Array.isArray(j.sections) && j.sections.length && j.sections.every((x: any) => Array.isArray(x.items) && x.items.length) && j.demographics.every((d: any) => d.question && Array.isArray(d.options) && d.options.length > 1)
+      if (!okShape) return res.status(502).json({ error: 'The questionnaire could not be created. Please try again.' })
+      await db.from('project_surveys').upsert({ project_id: projectId, questionnaire: j, data: null, results: null, updated_at: new Date().toISOString() })
+      return res.json({ ok: true, questionnaire: j })
+    }
+    if (action === 'write_results') {
+      const { data: sv } = await db.from('project_surveys').select('results,questionnaire').eq('project_id', projectId).single()
+      if (!sv?.results?.tables?.length) return res.status(400).json({ error: 'Upload your survey responses first.' })
+      const { data: sec } = await db.from('project_sections').select('*').eq('id', sectionId).eq('project_id', projectId).single()
+      if (!sec) return res.status(404).json({ error: 'Section not found' })
+      const R = sv.results
+      const allowed = new Set<number>([...(JSON.stringify(R).match(/\d+(\.\d+)?/g) || []).map(Number), 0, 1, 2, 3, 4, 5, 100])
+      const bad = (t: string) => [...new Set((t.match(/\d+(\.\d+)?/g) || []).map(Number))].filter(x => !allowed.has(x))
+      const prompt = `RESULTS (calculated by software from the students' real responses, n = ${R.n}):\n${JSON.stringify(R.tables)}\n\nOBJECTIVES: ${JSON.stringify((sv.questionnaire?.sections ?? []).map((x: any) => x.objective || x.title))}\n\nWrite the section "${sec.heading}" of Chapter Four as the analysis of these results, in simple English and in paragraphs. Refer to each table as Table 4.x and describe what it shows using only the figures given: counts, percentages, means, standard deviations and decisions. A mean of ${R.benchmark} or more is Agree. Do not repeat the tables. Do not use any number that is not in RESULTS. Do not invent causes, comparisons, sources or findings. About 600 to 900 words.`
+      let text = clean(await gemini(prompt, RULES)); let b = bad(text)
+      if (b.length) { text = clean(await gemini(prompt + `\nFIX: your last draft used numbers that are not in RESULTS (${b.join(', ')}). Rewrite without them.`, RULES)); b = bad(text) }
+      if (b.length) return res.status(422).json({ error: `The AI used numbers that are not in your data (${b.join(', ')}). Please try again.` })
+      await db.from('project_sections').update({ previous_content: sec.content, content: text, status: 'completed', user_edited: false, updated_at: new Date().toISOString() }).eq('id', sectionId)
+      await db.from('project_surveys').update({ section_id: sectionId }).eq('project_id', projectId)
+      return res.json({ ok: true })
+    }
+    if (action === 'make_questionnaire') {
+      const { data: mem } = await db.from('project_memory').select('data').eq('project_id', projectId).single()
+      const t = await gemini(`Project topic: ${project.topic}\nCourse: ${project.course_name}\nLevel: ${project.level}\nProject memory: ${JSON.stringify(mem?.data)}\n\nCreate a questionnaire for this final year project. Reply with ONLY this JSON shape:\n{"intro":"","demographics":[{"label":"Gender","question":"What is your gender?","options":["Male","Female"]}],"sections":[{"title":"","objective":"","items":["statement"]}]}\nRules: 4 to 6 demographic questions with closed options that suit this topic and its respondents. 3 to 5 sections, one for each research objective in the project memory (if there are none, make them from the topic). Each section has 5 to 8 statements in simple English that respondents rate from Strongly Agree to Strongly Disagree. Statements are single ideas, not leading, with no numbering. The intro is two sentences that explain the purpose and that answers are confidential. The label is a short noun such as Gender, Age or Level of study.`, 'You design university survey questionnaires. Reply with JSON only.', { json: true })
+      let j: any; try { j = JSON.parse(t.slice(t.indexOf('{'), t.lastIndexOf('}') + 1)) } catch { j = null }
+      const okShape = j && Array.isArray(j.demographics) && Array.isArray(j.sections) && j.sections.length && j.sections.every((x: any) => Array.isArray(x.items) && x.items.length) && j.demographics.every((d: any) => d.question && Array.isArray(d.options) && d.options.length > 1)
+      if (!okShape) return res.status(502).json({ error: 'The questionnaire could not be created. Please try again.' })
+      await db.from('project_surveys').upsert({ project_id: projectId, questionnaire: j, data: null, results: null, updated_at: new Date().toISOString() })
+      return res.json({ ok: true, questionnaire: j })
+    }
+    if (action === 'write_results') {
+      const { data: sv } = await db.from('project_surveys').select('results,questionnaire').eq('project_id', projectId).single()
+      if (!sv?.results?.tables?.length) return res.status(400).json({ error: 'Upload your survey responses first.' })
+      const { data: sec } = await db.from('project_sections').select('*').eq('id', sectionId).eq('project_id', projectId).single()
+      if (!sec) return res.status(404).json({ error: 'Section not found' })
+      const R = sv.results
+      const allowed = new Set<number>([...(JSON.stringify(R).match(/\d+(\.\d+)?/g) || []).map(Number), 0, 1, 2, 3, 4, 5, 100])
+      const bad = (t: string) => [...new Set((t.match(/\d+(\.\d+)?/g) || []).map(Number))].filter(x => !allowed.has(x))
+      const prompt = `RESULTS (calculated by software from the students' real responses, n = ${R.n}):\n${JSON.stringify(R.tables)}\n\nOBJECTIVES: ${JSON.stringify((sv.questionnaire?.sections ?? []).map((x: any) => x.objective || x.title))}\n\nWrite the section "${sec.heading}" of Chapter Four as the analysis of these results, in simple English and in paragraphs. Refer to each table as Table 4.x and describe what it shows using only the figures given: counts, percentages, means, standard deviations and decisions. A mean of ${R.benchmark} or more is Agree. Do not repeat the tables. Do not use any number that is not in RESULTS. Do not invent causes, comparisons, sources or findings. About 600 to 900 words.`
+      let text = clean(await gemini(prompt, RULES)); let b = bad(text)
+      if (b.length) { text = clean(await gemini(prompt + `\nFIX: your last draft used numbers that are not in RESULTS (${b.join(', ')}). Rewrite without them.`, RULES)); b = bad(text) }
+      if (b.length) return res.status(422).json({ error: `The AI used numbers that are not in your data (${b.join(', ')}). Please try again.` })
+      await db.from('project_sections').update({ previous_content: sec.content, content: text, status: 'completed', user_edited: false, updated_at: new Date().toISOString() }).eq('id', sectionId)
+      return res.json({ ok: true })
+    }
+    if (action === 'correct_section') {
+      const instruction = String(req.body?.instruction ?? '').slice(0, 4000)
+      const { data: s } = await db.from('project_sections').select('*').eq('id', sectionId).eq('project_id', projectId).single()
+      const { data: src } = await db.from('project_sources').select('citation,abstract').eq('project_id', projectId).neq('provenance', 'ai_generated')
+      const picked = pickRefs(src ?? [], `${project.topic} ${s.heading} ${instruction}`, 12)
+      const list = picked.map((x: any, i: number) => `[${i + 1}] ${String(x.citation).replace(/https?:\/\/\S+/g, '').trim()}\nABSTRACT: ${String(x.abstract || 'not available').slice(0, 450)}`).join('\n\n')
+      const out = await gemini(`Topic: ${project.topic}\nSection "${s.heading}" currently reads:\n${s.content}\n\nLECTURER CORRECTION:\n${instruction}\n\nRewrite the section applying this correction. Change only what is needed and keep everything else. Keep the citation style. ${CITE_LOOSE}\nSOURCES:\n${list}`, RULES, { search: true })
+      return res.json({ ok: true, text: fixCitations(clean(out), picked).text })
+    }
+    return res.status(400).json({ error: 'Unknown action' })
+  } catch (e) {
+    console.error('AI error:', e)
+    if ((e as any)?.code === 'search_quota') return res.status(429).json({ error: 'Google Search is out of quota. Turn on billing for your Gemini key, then try again.' })
+    const code = (e as { code?: number }).code
+    return res.status(code === 429 ? 429 : 500).json({ error: code === 429 ? 'Rate limit reached. We will retry shortly.' : 'Something went wrong. We will retry automatically.' })
+  }
+}

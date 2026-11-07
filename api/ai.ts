@@ -166,6 +166,13 @@ async function planProject(db: any, project: Record<string, any>) {
   return !!o.search || !!process.env.TAVILY_API_KEY
 }
 
+async function chapterRows(db: any, projectId: string, chapterId: string) {
+  const { data: ch } = await db.from('project_chapters').select('id,position,title').eq('id', chapterId).eq('project_id', projectId).single()
+  if (!ch) return null
+  const { data: secs } = await db.from('project_sections').select('id,heading,content').eq('chapter_id', ch.id).order('position')
+  return { ch, rows: (secs ?? []).map((x: any, i: number) => ({ ...x, label: `${ch.position}.${i + 1} ${x.heading}` })) }
+}
+
 export default async function handler(req: VercelRequest, res: VercelResponse) {
   const db = createClient((process.env.SUPABASE_URL || process.env.VITE_SUPABASE_URL)!, process.env.SUPABASE_SERVICE_ROLE_KEY!)
   const netErr = (e: any) => /fetch|retryable|network|timeout/i.test(String(e?.name) + String(e?.message))
@@ -287,6 +294,59 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       if (b.length) return res.status(422).json({ error: `The AI used numbers that are not in your data (${b.join(', ')}). Please try again.` })
       await db.from('project_sections').update({ previous_content: sec.content, content: text, status: 'completed', user_edited: false, updated_at: new Date().toISOString() }).eq('id', sectionId)
       return res.json({ ok: true })
+    }
+    if (action === 'correct_chapter') {
+      const instruction = String(req.body?.instruction ?? '').slice(0, 4000)
+      const { data: ch } = await db.from('project_chapters').select('id,position,title').eq('id', req.body?.chapterId).eq('project_id', projectId).single()
+      if (!ch) return res.status(404).json({ error: 'Chapter not found' })
+      const { data: secs } = await db.from('project_sections').select('id,heading,content').eq('chapter_id', ch.id).order('position')
+      const written = (secs ?? []).filter((x: any) => String(x.content ?? '').trim())
+      if (!written.length) return res.status(400).json({ error: 'This chapter has no text yet.' })
+      const { data: src } = await db.from('project_sources').select('citation,abstract').eq('project_id', projectId).neq('provenance', 'ai_generated')
+      const picked = pickRefs(src ?? [], `${project.topic} ${instruction}`, 12)
+      const list = picked.map((x: any, i: number) => `[${i + 1}] ${String(x.citation).replace(/https?:\/\/\S+/g, '').trim()}\nABSTRACT: ${String(x.abstract || 'not available').slice(0, 450)}`).join('\n\n')
+      const out = await gemini(`Topic: "${project.topic}"\nChapter ${ch.position}: ${ch.title}\nSECTIONS:\n${JSON.stringify(written.map((x: any, i: number) => ({ index: i, heading: x.heading, content: x.content })))}\n\nLECTURER CORRECTION:\n${instruction}\n\nDecide which sections must change to apply this correction. Rewrite ONLY those sections in full. Keep everything that is already correct, the same sub-headings and the same citation style, and stay strictly on the topic. ${CITE_LOOSE}\nSOURCES:\n${list}\nReply ONLY with JSON: {"changes":[{"index":0,"content":"full new text of that section"}]}. Use an empty list if nothing needs to change. Plain text only, no markdown.`, RULES, { json: true })
+      let j: any = {}; try { j = JSON.parse(out.slice(out.indexOf('{'), out.lastIndexOf('}') + 1)) } catch { return res.status(502).json({ error: 'The correction could not be read. Please try again.' }) }
+      const changes = (Array.isArray(j.changes) ? j.changes : []).filter((c: any) => Number.isInteger(c.index) && written[c.index] && String(c.content ?? '').trim()).map((c: any) => ({ id: written[c.index].id, heading: written[c.index].heading, text: fixCitations(clean(String(c.content)), picked).text }))
+      return res.json({ ok: true, changes })
+    }
+    if (action === 'read_page') {
+      const { image, mime, chapterId } = req.body ?? {}
+      if (!image || String(image).length > 9000000) return res.status(400).json({ error: 'The photo is missing or too large. Please use a clearer, smaller photo.' })
+      const c = await chapterRows(db, projectId, chapterId); if (!c) return res.status(404).json({ error: 'Chapter not found' })
+      const list = c.rows.map((x: any, i: number) => `#${i} | ${x.label} | starts: ${String(x.content ?? '').replace(/\s+/g, ' ').slice(0, 160)}`).join('\n')
+      const raw = await gemini(`This is a photo of a printed page of a student's project chapter that a lecturer marked by hand. Marks can be lines through words, underlines, circles, boxes, arrows, ticks, crosses, brackets and written notes in the margin or between the lines.\nSECTIONS OF THIS CHAPTER:\n${list}\n\nList EVERY mark you can see. For each mark give: sectionIndex (the section the marked printed text belongs to, matched by the printed words, headings and numbers, or -1 if unsure), marked (the printed words the mark points to, quoted exactly and kept short), and note (what the lecturer wrote, or "" if there is only a line, circle or underline). If handwriting cannot be read, write "[unreadable]" as the note. Never guess what a note says. Reply ONLY with JSON: {"items":[{"sectionIndex":0,"marked":"","note":""}]}`, 'You read lecturer mark-up on printed university project pages. Reply with JSON only.', { json: true, image: { mime: mime || 'image/jpeg', data: image } })
+      let j: any = {}; try { j = JSON.parse(raw.slice(raw.indexOf('{'), raw.lastIndexOf('}') + 1)) } catch { return res.status(502).json({ error: 'The page could not be read. Please try a clearer photo.' }) }
+      const items = (Array.isArray(j.items) ? j.items : []).slice(0, 40).map((x: any) => { const r = c.rows[Number(x.sectionIndex)]; return { sectionId: r?.id ?? null, label: r?.label ?? null, marked: String(x.marked ?? '').slice(0, 300), note: String(x.note ?? '').slice(0, 600) } })
+      return res.json({ ok: true, items })
+    }
+    if (action === 'place_items') {
+      const c = await chapterRows(db, projectId, req.body?.chapterId); if (!c) return res.status(404).json({ error: 'Chapter not found' })
+      const norm = (t: unknown) => String(t ?? '').toLowerCase().replace(/\s+/g, ' ').trim()
+      const items: any[] = (Array.isArray(req.body?.items) ? req.body.items : []).slice(0, 80).map((it: any) => {
+        const a = norm(it.marked).slice(0, 60); const hit = a.length >= 12 ? c.rows.find((r: any) => norm(r.content).includes(a)) : undefined
+        return { marked: String(it.marked ?? '').slice(0, 300), note: String(it.note ?? '').slice(0, 600), sectionId: hit?.id ?? null, label: hit?.label ?? null }
+      })
+      const rest = items.filter(x => !x.sectionId)
+      if (rest.length) {
+        try {
+          const list = c.rows.map((x: any, i: number) => `#${i} | ${x.label} | starts: ${String(x.content ?? '').replace(/\s+/g, ' ').slice(0, 160)}`).join('\n')
+          const t = await gemini(`SECTIONS:\n${list}\n\nMARKS:\n${rest.map((x, i) => `${i}. ${x.marked} | ${x.note}`).join('\n')}\n\nFor each mark decide which section it belongs to (-1 if unsure). Reply ONLY with JSON: {"assignments":[{"i":0,"sectionIndex":0}]}`, 'You match lecturer comments to sections. Reply with JSON only.', { json: true })
+          const j = JSON.parse(t.slice(t.indexOf('{'), t.lastIndexOf('}') + 1))
+          ;(j.assignments ?? []).forEach((a: any) => { const r = c.rows[Number(a.sectionIndex)]; const m = rest[Number(a.i)]; if (r && m) { m.sectionId = r.id; m.label = r.label } })
+        } catch { /* leave them unplaced */ }
+      }
+      return res.json({ ok: true, items })
+    }
+    if (action === 'rewrite_with_marks') {
+      const marks: any[] = (Array.isArray(req.body?.marks) ? req.body.marks : []).slice(0, 40)
+      const { data: sec } = await db.from('project_sections').select('id,heading,content').eq('id', sectionId).eq('project_id', projectId).single()
+      if (!sec || !marks.length) return res.status(404).json({ error: 'Section not found' })
+      const { data: src } = await db.from('project_sources').select('citation,abstract').eq('project_id', projectId).neq('provenance', 'ai_generated')
+      const picked = pickRefs(src ?? [], `${project.topic} ${sec.heading} ${marks.map((m: any) => m.note).join(' ')}`, 12)
+      const list = picked.map((x: any, i: number) => `[${i + 1}] ${String(x.citation).replace(/https?:\/\/\S+/g, '').trim()}\nABSTRACT: ${String(x.abstract || 'not available').slice(0, 450)}`).join('\n\n')
+      const out = await gemini(`Topic: "${project.topic}"\nSection "${sec.heading}" currently reads:\n${sec.content}\n\nTHE LECTURER MARKED THESE PLACES:\n${marks.map((m: any, i: number) => `${i + 1}. Marked text: "${m.marked}" | Lecturer's note: ${m.note ? m.note : '(no note, only a line, circle or underline: treat the marked words as wrong or weak and fix or improve them)'}`).join('\n')}\n\nApply every mark. Change only what is needed, keep everything else, keep the same sub-headings and citation style, and stay strictly on the topic. ${CITE_LOOSE}\nSOURCES:\n${list}\nReply with the full corrected section as plain text only.`, RULES)
+      return res.json({ ok: true, id: sec.id, heading: sec.heading, text: fixCitations(clean(out), picked).text })
     }
     if (action === 'correct_section') {
       const instruction = String(req.body?.instruction ?? '').slice(0, 4000)

@@ -124,3 +124,48 @@ function citedOnly(so: Row[], se: Row[]): Row[] {
   })
   return (hit.length ? hit : so).slice().sort((a, b) => String(a.citation).localeCompare(String(b.citation)))
 }
+
+// ---------- One chapter as PDF or DOCX ----------
+const CHN = ['ONE', 'TWO', 'THREE', 'FOUR', 'FIVE', 'SIX', 'SEVEN']
+async function chapterData(id: string, chapterId: string) {
+  const { sv, p, ch, se } = await collect(id)
+  const { data: srcAll } = await supabase.from('project_sources').select('*').eq('project_id', id)
+  const i = ch.findIndex(x => x.id === chapterId); if (i < 0) throw new Error('chapter not found')
+  const secs = se.filter(x => x.chapter_id === chapterId)
+  const text = secs.map(x => String(x.content ?? '')).join('\n')
+  const esc = (x: string) => x.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+  const refs = ((srcAll ?? []) as Row[]).filter(r => {
+    const sur = String(r.citation).split(',')[0].trim(); const yr = String(r.citation).match(/\((\d{4})[a-z]?\)/)?.[1]
+    return !!sur && !!yr && new RegExp(esc(sur) + '[^()]{0,60}' + yr).test(text)
+  }).sort((a, b) => String(a.citation).localeCompare(String(b.citation)))
+  return { sv, p, c: ch[i], i, secs, refs }
+}
+export async function exportChapterPdf(id: string, chapterId: string) {
+  const { jsPDF } = await import('jspdf'); const autoTable = (await import('jspdf-autotable')).default
+  const { sv, p, c, i, secs, refs } = await chapterData(id, chapterId)
+  const d = new jsPDF({ unit: 'pt', format: 'a4' }); const W = d.internal.pageSize.getWidth(), H = d.internal.pageSize.getHeight(), m = 72; let y = m
+  const add = (t: string, size: number, bold = false, gap = 8, center = false) => { d.setFont('times', bold ? 'bold' : 'normal'); d.setFontSize(size); d.setTextColor(20); for (const l of d.splitTextToSize(t, W - 2 * m)) { if (y > H - m) { d.addPage(); y = m } if (center) d.text(l, W / 2, y, { align: 'center' }); else d.text(l, m, y); y += size * 1.5 } y += gap }
+  add(String(p.topic).toUpperCase(), 13, true, 14, true)
+  add(`CHAPTER ${CHN[i] ?? i + 1}`, 14, true, 0, true); add(String(c.title).toUpperCase(), 14, true, 14, true)
+  secs.forEach((s, j) => { add(`${i + 1}.${j + 1} ${s.heading}`, 12, true, 4); add(clean(s.content || '[Not yet written]'), 12); if (sv?.results && sv.section_id === s.id) y = pdfSurvey(d, autoTable, sv.results, y) })
+  if (refs.length) { add('References', 13, true, 8); refs.forEach(r => add(String(r.citation), 11, false, 4)) }
+  const n = d.getNumberOfPages(); for (let k = 1; k <= n; k++) { d.setPage(k); d.setFontSize(10); d.text(String(k), W / 2, H - 36, { align: 'center' }) }
+  d.save(`Chapter ${CHN[i] ?? i + 1}.pdf`)
+}
+export async function exportChapterDocx(id: string, chapterId: string) {
+  const DX = await import('docx'); const { Document, Packer, Paragraph, HeadingLevel, TextRun, Footer, PageNumber, AlignmentType } = DX
+  const { sv, p, c, i, secs, refs } = await chapterData(id, chapterId)
+  const kids: any[] = [
+    new Paragraph({ alignment: AlignmentType.CENTER, spacing: { after: 240 }, children: [new TextRun({ text: String(p.topic).toUpperCase(), bold: true, size: 26, font: 'Times New Roman' })] }),
+    new Paragraph({ text: `CHAPTER ${CHN[i] ?? i + 1}`, heading: HeadingLevel.HEADING_1, alignment: AlignmentType.CENTER }),
+    new Paragraph({ text: String(c.title).toUpperCase(), heading: HeadingLevel.HEADING_1, alignment: AlignmentType.CENTER }),
+  ]
+  secs.forEach((s, j) => {
+    kids.push(new Paragraph({ text: `${i + 1}.${j + 1} ${s.heading}`, heading: HeadingLevel.HEADING_2 }))
+    clean(String(s.content || '[Not yet written]')).split(/\n+/).forEach(t => kids.push(new Paragraph({ spacing: { after: 160, line: 360 }, children: [new TextRun({ text: t, font: 'Times New Roman', size: 24 })] })))
+    if (sv?.results && sv.section_id === s.id) kids.push(...docxSurvey(DX, sv.results))
+  })
+  if (refs.length) kids.push(new Paragraph({ text: 'References', heading: HeadingLevel.HEADING_2 }), ...refs.map(r => new Paragraph({ spacing: { after: 120 }, children: [new TextRun({ text: String(r.citation), font: 'Times New Roman', size: 22 })] })))
+  const doc = new Document({ sections: [{ children: kids, footers: { default: new Footer({ children: [new Paragraph({ alignment: AlignmentType.CENTER, children: [new TextRun({ children: [PageNumber.CURRENT] })] })] }) } }] })
+  const a = document.createElement('a'); a.href = URL.createObjectURL(await Packer.toBlob(doc)); a.download = `Chapter ${CHN[i] ?? i + 1}.docx`; a.click()
+}

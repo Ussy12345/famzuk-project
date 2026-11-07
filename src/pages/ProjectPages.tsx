@@ -3,7 +3,8 @@ import { Link, NavLink, useNavigate, useParams } from 'react-router-dom'
 import { supabase, callAI } from '../lib/supabase'
 import { buildTemplate } from '../lib/templates'
 import { clean } from '../lib/clean'
-import { exportPdf, exportDocx, exportSectionPdf, exportSectionDocx } from '../lib/export'
+import { exportPdf, exportDocx, exportSectionPdf, exportSectionDocx, exportChapterPdf, exportChapterDocx } from '../lib/export'
+import { readDocxMarks } from '../lib/docxMarks'
 type Row = Record<string, any>
 const sleep = (ms: number) => new Promise(r => setTimeout(r, ms))
 
@@ -90,48 +91,185 @@ export function Interview() {
       {busy && !cur && <p>Preparing your next question…</p>}{err && <p role="alert" className="text-red-700">{err} <button className="underline" onClick={next}>Try again</button></p>}</div></Shell>
 }
 
+const CHW = ['ONE', 'TWO', 'THREE', 'FOUR', 'FIVE', 'SIX', 'SEVEN']
+const PRE = ['Title Page', 'Certification', 'Approval Page', 'Dedication', 'Acknowledgments', 'Abstract', 'Table of Contents', 'List of Tables', 'List of Figures']
+
 export function Generate() {
-  const { id, p, reload } = useProject(); const [pages, setPages] = useState(40); const [secs, setSecs] = useState<Row[]>([]); const [chs, setChs] = useState<Row[]>([]); const [act, setAct] = useState(''); const [run, setRun] = useState(false); const [planning, setPlanning] = useState(false); const [err, setErr] = useState(''); const [searched, setSearched] = useState<boolean | null>(null); const stop = useRef(false); const [refBusy, setRefBusy] = useState(false); const [eta, setEta] = useState(0); const tp = useTimed(planning, 60); const tr = useTimed(refBusy, 75)
-  const load = async () => { const [a, b] = await Promise.all([supabase.from('project_chapters').select('*').eq('project_id', id).order('position'), supabase.from('project_sections').select('*').eq('project_id', id).order('position')]); setChs(a.data ?? []); setSecs(b.data ?? []); return b.data ?? [] }
+  const { id, p, reload } = useProject()
+  const [pages, setPages] = useState(40), [secs, setSecs] = useState<Row[]>([]), [chs, setChs] = useState<Row[]>([])
+  const [act, setAct] = useState(''), [runId, setRunId] = useState(''), [planning, setPlanning] = useState(false), [refBusy, setRefBusy] = useState(false)
+  const [err, setErr] = useState(''), [note, setNote] = useState(''), [searched, setSearched] = useState<boolean | null>(null), [eta, setEta] = useState(0)
+  const [fix, setFix] = useState<Row | null>(null), [corr, setCorr] = useState(''), [prop, setProp] = useState<Row[] | null>(null), [cbusy, setCbusy] = useState(false), [ferr, setFerr] = useState('')
+  const stop = useRef(false); const tp = useTimed(planning, 90); const tr = useTimed(refBusy, 75)
+  const [up, setUp] = useState<null | { c: Row; phase: 'pick' | 'busy' | 'review'; msg: string; items: Row[]; skipped: string[] }>(null)
+  const load = async () => {
+    const [a, b] = await Promise.all([supabase.from('project_chapters').select('*').eq('project_id', id).order('position'), supabase.from('project_sections').select('*').eq('project_id', id).order('position')])
+    setChs(a.data ?? []); setSecs(b.data ?? []); return (b.data ?? []) as Row[]
+  }
   useEffect(() => { load() }, [id]); useEffect(() => { if (p?.target_pages) setPages(p.target_pages) }, [p?.target_pages])
-  async function plan() { setPlanning(true); setErr(''); await supabase.from('projects').update({ target_pages: pages }).eq('id', id); const r = await callAI({ action: 'plan', projectId: id }); if (r.error) setErr(r.error); else setSearched(!!r.searched); await load(); setPlanning(false); reload() }
+
+  async function plan() {
+    setPlanning(true); setErr(''); await supabase.from('projects').update({ target_pages: pages }).eq('id', id)
+    const r = await callAI({ action: 'plan', projectId: id }); if (r.error) setErr(r.error); else setSearched(!!r.searched)
+    await load(); setPlanning(false); reload()
+  }
   async function remove(sid: string) { await supabase.from('project_sections').delete().eq('id', sid); load() }
-  async function start() {
-    setRun(true); stop.current = false; await supabase.from('projects').update({ status: 'generating' }).eq('id', id)
+
+  async function writeChapter(c: Row, rewrite = false) {
+    if (runId) return
+    const idx = chs.findIndex(x => x.id === c.id); const W = CHW[idx] ?? String(idx + 1)
+    setErr(''); stop.current = false; setRunId(c.id)
+    setNote(`I will start writing Chapter ${W} (${c.title}) for you now. I write one chapter at a time so that each one stays accurate. When it is ready you can read it, ask for corrections and download it before we move on.`)
+    await supabase.from('projects').update({ status: 'generating' }).eq('id', id)
+    if (rewrite) await supabase.from('project_sections').update({ status: 'pending' }).eq('chapter_id', c.id)
     const have = await supabase.from('project_sources').select('id', { count: 'exact', head: true }).eq('project_id', id)
-    if (!have.count) { setRefBusy(true); setAct('Finding and checking real references with Google Search…'); await callAI({ action: 'find_references', projectId: id }); setRefBusy(false) }
-    const t0 = Date.now(); let n0 = 0; const gaveUp = new Set<string>(); const tries: Record<string, number> = {}
+    if (!have.count) { setRefBusy(true); setAct('Finding and checking real references…'); await callAI({ action: 'find_references', projectId: id }); setRefBusy(false) }
+    const gaveUp = new Set<string>(); const tries: Record<string, number> = {}; const t0 = Date.now(); let n0 = 0
     for (;;) {
-      const all = await load(); const s = all.find(x => x.status !== 'completed' && !gaveUp.has(x.id)); if (!s || stop.current) break
-      setAct(`Writing ${chs.find(c => c.id === s.chapter_id)?.title ?? ''} — ${s.heading}`); tries[s.id] = (tries[s.id] ?? 0) + 1
+      const mine = (await load()).filter(x => x.chapter_id === c.id)
+      const s = mine.find(x => x.status !== 'completed' && !gaveUp.has(x.id)); if (!s || stop.current) break
+      setAct(`Writing ${s.heading}…`); tries[s.id] = (tries[s.id] ?? 0) + 1
       await supabase.from('project_generation_jobs').update({ status: 'running', attempts: tries[s.id], started_at: new Date().toISOString() }).eq('section_id', s.id)
       const r = await callAI({ action: 'generate_section', projectId: id, sectionId: s.id })
-      if (r.auth || /out of quota/i.test(r.error ?? '')) stop.current = true
-      if (r.ok) { n0++; setEta(Math.round(((Date.now() - t0) / 1000 / n0) * (all.filter(x => x.status !== 'completed').length - 1))); await supabase.from('project_generation_jobs').update({ status: 'completed', completed_at: new Date().toISOString() }).eq('section_id', s.id) }
+      if (r.auth || /out of quota/i.test(r.error ?? '')) { stop.current = true; setErr(r.error) }
+      if (r.ok) { n0++; setEta(Math.round(((Date.now() - t0) / 1000 / n0) * (mine.filter(x => x.status !== 'completed').length - 1))); await supabase.from('project_generation_jobs').update({ status: 'completed', completed_at: new Date().toISOString() }).eq('section_id', s.id) }
       else { await supabase.from('project_generation_jobs').update({ status: 'failed', error: r.error }).eq('section_id', s.id); if (tries[s.id] >= 3) gaveUp.add(s.id); setAct(r.error ?? 'Retrying…'); await sleep(/Rate|internet|Network|unexpected/i.test(r.error ?? '') ? 30000 : 3000) }
       await sleep(1500)
     }
-    const fin = await load(); await supabase.from('projects').update({ status: fin.every(x => x.status === 'completed') ? 'review' : 'failed' }).eq('id', id); setRun(false); setAct(''); reload()
+    const fin = await load(); const mine = fin.filter(x => x.chapter_id === c.id); const ready = mine.length > 0 && mine.every(x => x.status === 'completed')
+    await supabase.from('projects').update({ status: fin.every(x => x.status === 'completed') ? 'review' : ready ? 'ready' : 'failed' }).eq('id', id)
+    const nx = chs[idx + 1]
+    setNote(ready ? `Chapter ${W} is ready. Please read it in the Editor. If your lecturer marked corrections, use "Correct this chapter". When you are happy with it, ${nx ? `we can continue to Chapter ${CHW[idx + 1] ?? idx + 2}.` : 'your project is complete. You can download it from Settings.'}` : stop.current ? `I paused Chapter ${W}. Press Continue when you are ready.` : `Some sections of Chapter ${W} could not be written. Press Continue to try them again.`)
+    setRunId(''); setAct(''); reload()
   }
-  const done = secs.filter(s => s.status === 'completed').length; const pct = secs.length ? Math.round((done / secs.length) * 100) : 0; const started = done > 0 || run
-  const icon = (st: string) => (st === 'completed' ? '✓' : st === 'generating' ? '…' : st === 'failed' ? '!' : '○')
-  return <Shell id={id} p={p}><h1 className="font-display text-2xl font-semibold">Your project</h1>
+
+  const closeFix = () => { setFix(null); setProp(null); setCorr(''); setFerr('') }
+  async function checkFix() {
+    if (!fix || !corr.trim()) return; setCbusy(true); setFerr('')
+    const r = await callAI({ action: 'correct_chapter', projectId: id, chapterId: fix.id, instruction: corr }); setCbusy(false)
+    if (r.ok) setProp(r.changes ?? []); else setFerr(r.error ?? 'Could not apply the correction. Please try again.')
+  }
+  async function applyFix() {
+    const list = prop ?? []
+    for (const x of list) { const old = secs.find(y => y.id === x.id); await supabase.from('project_sections').update({ previous_content: old?.content, content: x.text, user_edited: true, updated_at: new Date().toISOString() }).eq('id', x.id) }
+    setNote(`I applied your corrections to ${list.length} section(s). Open the Editor to read them, and download the chapter when you are happy.`); closeFix(); await load()
+  }
+
+  async function readFiles(files: File[]) {
+    if (!up) return; const c = up.c
+    const imgs = files.filter(f => f.type.startsWith('image/')), docs = files.filter(f => /\.docx$/i.test(f.name))
+    if (!imgs.length && !docs.length) return setUp({ ...up, msg: 'Please choose photos (JPG or PNG) or a Word (.docx) file.' })
+    const items: Row[] = []; const skipped: string[] = []
+    const say = (msg: string) => setUp(u => u && { ...u, phase: 'busy', msg })
+    try {
+      for (const [i, f] of imgs.entries()) {
+        say(`Reading page ${i + 1} of ${imgs.length}…`)
+        const im = await toJpeg(f); const r = await callAI({ action: 'read_page', projectId: id, chapterId: c.id, image: im.data, mime: im.mime })
+        if (!r.ok) { skipped.push(`Photo ${i + 1}: ${r.error ?? 'could not be read'}`); continue }
+        ;(r.items ?? []).forEach((x: Row) => items.push({ ...x, page: `Photo ${i + 1}` }))
+      }
+      for (const f of docs) {
+        say('Reading the comments in your Word file…')
+        const marks = await readDocxMarks(f)
+        if (!marks.length) { skipped.push(`${f.name}: no comments or tracked changes were found`); continue }
+        const r = await callAI({ action: 'place_items', projectId: id, chapterId: c.id, items: marks })
+        if (!r.ok) { skipped.push(`${f.name}: ${r.error ?? 'could not be read'}`); continue }
+        ;(r.items ?? []).forEach((x: Row) => items.push({ ...x, page: f.name }))
+      }
+    } catch { skipped.push('Something went wrong while reading the files. Please try again.') }
+    setUp({ c, phase: 'review', msg: '', items, skipped })
+  }
+  async function applyMarks() {
+    if (!up) return
+    const usable = up.items.filter(x => x.sectionId && !/unreadable/i.test(x.note ?? ''))
+    const groups = new Map<string, Row[]>(); usable.forEach(x => groups.set(x.sectionId, [...(groups.get(x.sectionId) ?? []), x]))
+    const changes: Row[] = []; const fails: string[] = []; let n = 0
+    for (const [sid, marks] of groups) {
+      setUp(u => u && { ...u, phase: 'busy', msg: `Correcting section ${++n} of ${groups.size}…` })
+      const r = await callAI({ action: 'rewrite_with_marks', projectId: id, sectionId: sid, marks })
+      if (r.ok) changes.push({ id: r.id, heading: r.heading, text: r.text }); else fails.push(r.error ?? 'A section could not be corrected.')
+    }
+    const c = up.c; setUp(null); if (fails.length) setErr(fails[0]); setFix(c); setProp(changes)
+  }
+  const started = secs.some(x => x.status === 'completed')
+  const mineOf = (c: Row) => secs.filter(x => x.chapter_id === c.id)
+  const readyOf = (c: Row) => mineOf(c).length > 0 && mineOf(c).every(x => x.status === 'completed')
+  const dl = 'btn-ghost !px-3 !py-2 text-sm'
+
+  return <Shell id={id} p={p}>
+    <h1 className="font-display text-2xl font-semibold">Your project</h1>
     {!secs.length && <div className="mt-4"><p className="font-medium">How detailed should your project be?</p><p className="mb-3 text-sm text-ink/60">Page count is approximate. Real length depends on font, spacing, tables, figures and references.</p>
       <div className="flex flex-wrap gap-2">{[20, 40, 60, 80, 100].map(n => <button key={n} onClick={() => setPages(n)} className={`rounded-lg border px-4 py-2 ${pages === n ? 'border-gold bg-gold/10' : 'border-line bg-white'}`}>{n}{n === 100 ? '+' : ''} pages</button>)}</div>
-      <button className="btn-gold mt-5" disabled={planning} onClick={plan}>{planning ? 'Working…' : 'Create my table of contents'}</button>{planning && <div className="mt-5"><Ring pct={tp.pct} label="Researching your topic with Google Search and building your contents" sub={tp.over ? 'Almost done…' : `About ${tp.left}s left`} /></div>}</div>}
-    {err && <p role="alert" className="mt-3 text-sm text-red-700">{err} <button className="underline" onClick={plan}>Retry</button></p>}
-    {secs.length > 0 && <div className="mt-4">
-      {started ? <>{refBusy ? <Ring pct={tr.pct} label="Finding and checking real references…" sub={tr.over ? 'Almost done…' : `About ${tr.left}s left`} /> : <Ring pct={pct} label={act || (done === secs.length ? 'All sections written' : 'Paused')} sub={run && eta > 0 ? `About ${eta >= 90 ? Math.round(eta / 60) + ' min' : eta + 's'} left` : undefined} />}</>
-        : <p className="text-sm text-ink/70">This table of contents was planned for your topic using Google Search research. Remove any section you do not want, or regenerate it, then approve to start writing.</p>}
-      {searched === true && <p className="mt-3 text-sm text-green-800">This outline was checked against Google Search results.</p>}{searched === false && <p className="mt-3 text-sm text-amber-800">Google Search was unavailable (quota), so this outline came from the AI's own knowledge. Please review it before approving.</p>}
-      <div className="mt-4 rounded-xl border border-line bg-white p-5"><h2 className="font-display text-lg font-semibold">TABLE OF CONTENTS</h2>
-        <p className="mt-3 font-semibold">Preliminary Pages</p><ul className="ml-5 mt-1 list-disc text-sm">{PRELIM.map(x => <li key={x}>{x}</li>)}</ul>
-        <ul className="mt-4 space-y-4">{chs.map(c => <li key={c.id}><b>CHAPTER {NUM[c.position - 1] ?? c.position}: {String(c.title).toUpperCase()}</b><ul className="mt-1 space-y-1">{secs.filter(x => x.chapter_id === c.id).map((x, j) => <li key={x.id} className="flex items-center justify-between gap-2 text-sm"><span>{started ? icon(x.status) + ' ' : ''}{c.position}.{j + 1} {x.heading}</span>{!started && <button aria-label="Remove section" className="px-2 text-ink/40 hover:text-red-700" onClick={() => remove(x.id)}>×</button>}</li>)}</ul></li>)}</ul><ul className="ml-5 mt-4 list-disc text-sm"><li>References</li><li>Appendices</li></ul></div></div>}
-    {secs.length > 0 && <div className="mt-6 flex flex-wrap gap-3">
-      {!started && <button className="btn-ghost" disabled={planning} onClick={plan}>{planning ? 'Regenerating…' : 'Regenerate contents'}</button>}
-      <button className="btn-gold" disabled={run || planning} onClick={start}>{run ? 'Writing…' : started ? 'Continue writing' : 'Approve and start writing'}</button>
-      {run && <button className="btn-ghost" onClick={() => (stop.current = true)}>Pause</button>}{done > 0 && !run && <Link className="btn-ghost" to={`/projects/${id}/editor`}>Open editor</Link>}</div>}
-    <p className="mt-3 text-sm text-ink/60">Keep this tab open while writing. Each section is saved as soon as it is done; failed sections retry on their own.</p></Shell>
+      <button className="btn-gold mt-5" disabled={planning} onClick={plan}>{planning ? 'Working…' : 'Create my table of contents'}</button>
+      {planning && <div className="mt-5"><Ring pct={tp.pct} label="Researching your topic and building your contents" sub={tp.over ? 'Almost done…' : `About ${tp.left}s left`} /></div>}</div>}
+    {err && <p role="alert" className="mt-3 rounded-lg bg-red-50 p-3 text-sm text-red-800">{err}</p>}
+    {note && <div className="mt-4 rounded-xl border-l-4 border-gold bg-white p-4 text-sm leading-6"><p className="font-semibold">Famzuk</p><p>{note}</p></div>}
+    {runId && <div className="mt-4">{refBusy ? <Ring pct={tr.pct} label="Finding and checking real references…" sub={tr.over ? 'Almost done…' : `About ${tr.left}s left`} /> : (() => { const c = chs.find(x => x.id === runId)!; const m = mineOf(c); const d = m.filter(x => x.status === 'completed').length; return <Ring pct={m.length ? Math.round((d / m.length) * 100) : 0} label={act || 'Working…'} sub={eta > 0 ? `About ${eta >= 90 ? Math.round(eta / 60) + ' min' : eta + 's'} left in this chapter` : undefined} /> })()}
+      <button className="btn-ghost mt-3 !py-2 text-sm" onClick={() => (stop.current = true)}>Pause</button></div>}
+    {secs.length > 0 && <>
+      {!started && searched === true && <p className="mt-3 text-sm text-green-800">This outline was checked against Google Search results.</p>}
+      {!started && searched === false && <p className="mt-3 text-sm text-amber-800">Google Search was unavailable (quota), so this outline came from the AI's own knowledge. Please review it before writing.</p>}
+      {!started && <p className="mt-3 text-sm text-ink/70">Remove any section you do not want with ×, or regenerate the contents. Then start with Chapter One.</p>}
+      <div className="mt-4 rounded-xl border border-line bg-white p-4"><p className="font-semibold">Preliminary Pages</p><ul className="ml-5 mt-1 list-disc text-sm text-ink/70">{PRE.map(x => <li key={x}>{x}</li>)}</ul></div>
+      {chs.map((c, i) => {
+        const m = mineOf(c); const d = m.filter(x => x.status === 'completed').length; const ready = readyOf(c); const here = runId === c.id
+        const prevReady = i === 0 || readyOf(chs[i - 1]); const W = CHW[i] ?? String(i + 1)
+        return <article key={c.id} className="mt-4 rounded-xl border border-line bg-white p-4">
+          <div className="flex flex-wrap items-start justify-between gap-2"><h2 className="font-semibold">CHAPTER {W}: {String(c.title).toUpperCase()}</h2>
+            <span className={`rounded-full px-3 py-1 text-xs font-semibold ${ready ? 'bg-green-100 text-green-800' : d ? 'bg-gold/20' : 'bg-tab text-ink/60'}`}>{ready ? 'Ready' : here ? 'Writing…' : d ? `${d}/${m.length} written` : 'Not started'}</span></div>
+          <ul className="mt-2 space-y-1 text-sm">{m.map((x, j) => <li key={x.id} className="flex items-center justify-between gap-2"><span className="text-ink/80">{ready || x.status === 'completed' ? '✓ ' : ''}{i + 1}.{j + 1} {x.heading}</span>{!d && !here && !started && <button aria-label="Remove section" className="px-2 text-ink/40 hover:text-red-700" onClick={() => remove(x.id)}>×</button>}</li>)}</ul>
+          <div className="mt-3 flex flex-wrap gap-2">
+            {!ready && <button className="btn-gold !px-4 !py-2 text-sm" disabled={!!runId || !prevReady || !m.length} onClick={() => writeChapter(c)}>{here ? 'Writing…' : d ? `Continue Chapter ${W}` : `Write Chapter ${W}`}</button>}
+            {ready && <button className={dl} disabled={!!runId} onClick={() => { if (confirm(m.some(x => x.user_edited) ? 'You edited some sections. Rewriting replaces ALL of them. Continue?' : 'Rewrite this whole chapter from the start?')) writeChapter(c, true) }}>Rewrite</button>}
+            {d > 0 && <button className={dl} onClick={() => setFix(c)}>Correct this chapter</button>}
+            {d > 0 && <button className={dl} onClick={() => setUp({ c, phase: 'pick', msg: '', items: [], skipped: [] })}>Lecturer's corrections (photo or Word)</button>}
+            {d > 0 && <button className={dl} onClick={() => exportChapterPdf(id, c.id)}>PDF</button>}
+            {d > 0 && <button className={dl} onClick={() => exportChapterDocx(id, c.id)}>DOCX</button>}
+            {d > 0 && <Link className={dl} to={`/projects/${id}/editor`}>Open Editor</Link>}
+          </div>
+          {!prevReady && !ready && <p className="mt-2 text-xs text-ink/50">Finish Chapter {CHW[i - 1]} first.</p>}
+        </article>
+      })}
+      {!started && !runId && <button className="btn-ghost mt-4" disabled={planning} onClick={plan}>{planning ? 'Regenerating…' : 'Regenerate contents'}</button>}
+      <p className="mt-3 text-sm text-ink/60">Keep this tab open while a chapter is being written. Each section is saved as soon as it is done.</p>
+    </>}
+    {up && <Modal title={`Lecturer's corrections: Chapter ${CHW[chs.findIndex(x => x.id === up.c.id)] ?? ''}`} onClose={() => { if (up.phase !== 'busy') setUp(null) }}>
+      {up.phase === 'pick' && <>
+        <p className="text-sm text-ink/60">Take a clear photo of every page your lecturer marked (you can choose many photos at once), or upload the Word file with the lecturer's comments. The AI finds the lines, circles and notes, matches them to the right section, and corrects only those places.</p>
+        <label className="btn-gold mt-4 cursor-pointer">Choose photos or a Word file<input type="file" multiple accept="image/*,.docx" className="hidden" onChange={e => { const f = Array.from(e.target.files ?? []); if (f.length) readFiles(f); e.target.value = '' }} /></label>
+        {up.msg && <p role="alert" className="mt-3 text-sm text-red-700">{up.msg}</p>}
+        <p className="mt-3 text-xs text-ink/50">Tips: lay the page flat, use good light, keep the whole page in the picture, and take one photo per page. The pages should be printed from this chapter.</p>
+      </>}
+      {up.phase === 'busy' && <p className="text-sm">{up.msg} Please wait, this can take a few minutes.</p>}
+      {up.phase === 'review' && <>
+        {up.items.length === 0 ? <p className="text-sm">I could not find any marks. Try clearer photos, or type the correction with "Correct this chapter".</p> : <>
+          <p className="text-sm font-semibold">I found {up.items.filter(x => x.sectionId).length} mark(s). Remove any that are wrong, then apply.</p>
+          <ul className="mt-2 space-y-2">{up.items.map((x, k) => x.sectionId && <li key={k} className="rounded-lg border border-line p-3 text-sm">
+            <div className="flex items-start justify-between gap-2"><span className="font-semibold">{x.label} <span className="font-normal text-ink/50">({x.page})</span></span><button aria-label="Remove this mark" className="px-2 text-ink/40 hover:text-red-700" onClick={() => setUp(u => u && { ...u, items: u.items.filter((_, i) => i !== k) })}>×</button></div>
+            {x.marked && <p className="mt-1 text-ink/70">Marked: "{x.marked}"</p>}
+            <p className="mt-1">{x.note ? (/unreadable/i.test(x.note) ? 'Note could not be read. This mark will be skipped.' : `Note: ${x.note}`) : 'Line or circle only, no note. I will fix or improve those words.'}</p></li>)}</ul>
+          {up.items.some(x => !x.sectionId) && <div className="mt-3"><p className="text-sm font-semibold">Could not match to a section (skipped)</p><ul className="ml-5 list-disc text-sm text-ink/70">{up.items.filter(x => !x.sectionId).map((x, k) => <li key={k}>{x.marked || 'Unmarked text'}{x.note ? `: ${x.note}` : ''}</li>)}</ul></div>}
+        </>}
+        {up.skipped.length > 0 && <ul className="mt-3 ml-5 list-disc text-sm text-amber-800">{up.skipped.map((m, k) => <li key={k}>{m}</li>)}</ul>}
+        <div className="mt-4 flex flex-wrap justify-end gap-2"><button className="btn-ghost" onClick={() => setUp({ ...up, phase: 'pick', msg: '' })}>Choose other files</button><button className="btn-primary" disabled={!up.items.some(x => x.sectionId && !/unreadable/i.test(x.note ?? ''))} onClick={applyMarks}>Apply corrections</button></div>
+      </>}
+    </Modal>}
+    {fix && <Modal title={`Correct Chapter ${CHW[chs.findIndex(x => x.id === fix.id)] ?? ''}`} onClose={closeFix}>
+      {!prop ? <>
+        <p className="text-sm text-ink/60">Type what your lecturer wrote about this chapter. The AI changes only the sections that need it, and you check them before anything is saved.</p>
+        <textarea className="input mt-3 min-h-[30vh] resize-y" placeholder="e.g. Rewrite the problem statement so it follows the objectives, and add more recent studies" value={corr} onChange={e => setCorr(e.target.value)} autoFocus />
+        {ferr && <p role="alert" className="mt-2 text-sm text-red-700">{ferr}</p>}
+        <div className="mt-4 flex justify-end gap-2"><button className="btn-ghost" onClick={closeFix}>Cancel</button><button className="btn-gold" disabled={cbusy || !corr.trim()} onClick={checkFix}>{cbusy ? 'Checking the chapter… (up to a minute)' : 'Apply correction'}</button></div>
+      </> : prop.length === 0 ? <>
+        <p className="text-sm">I did not find anything in this chapter that needs to change for that note. Try describing the problem more exactly.</p>
+        <div className="mt-4 flex justify-end gap-2"><button className="btn-ghost" onClick={() => setProp(null)}>Back</button></div>
+      </> : <>
+        <p className="text-sm font-semibold">{prop.length} section(s) changed (preview)</p>
+        {prop.map(x => <div key={x.id} className="mt-3"><p className="text-sm font-semibold">{x.heading}</p><div className="mt-1 max-h-[28vh] overflow-y-auto whitespace-pre-wrap rounded-lg border border-gold bg-gold/5 p-3 text-sm leading-6">{x.text}</div></div>)}
+        <div className="mt-4 flex flex-wrap justify-end gap-2"><button className="btn-ghost" onClick={() => setProp(null)}>Back</button><button className="btn-primary" onClick={applyFix}>Keep these changes</button></div>
+      </>}
+    </Modal>}
+  </Shell>
 }
 
 function Modal({ title, onClose, children }: { title: string; onClose: () => void; children: ReactNode }) {
