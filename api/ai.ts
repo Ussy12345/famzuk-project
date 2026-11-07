@@ -239,6 +239,55 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       const out = await gemini(`Topic: ${project.topic}\nSection "${sec.heading}" currently reads:\n${sec.content}\n\nLECTURER CORRECTIONS read from the marked page:\n${readable.map((c, i) => `${i + 1}. ${c}`).join('\n')}\n\nRewrite the section applying these corrections. Change only what is needed and keep everything else. Keep the citation style. ${CITE_LOOSE}\nSOURCES:\n${refList}`, RULES, { search: true })
       return res.json({ ok: true, sectionId: sec.id, label: sec.label, confidence: j.confidence ?? 'medium', comments, text: fixCitations(clean(out), picked).text })
     }
+    if (action === 'make_questionnaire') {
+      const { data: mem } = await db.from('project_memory').select('data').eq('project_id', projectId).single()
+      const t = await gemini(`Project topic: ${project.topic}\nCourse: ${project.course_name}\nLevel: ${project.level}\nProject memory: ${JSON.stringify(mem?.data)}\n\nCreate a questionnaire for this final year project. Reply with ONLY this JSON shape:\n{"intro":"","demographics":[{"label":"Gender","question":"What is your gender?","options":["Male","Female"]}],"sections":[{"title":"","objective":"","items":["statement"]}]}\nRules: 4 to 6 demographic questions with closed options that suit this topic and its respondents. 3 to 5 sections, one for each research objective in the project memory (if there are none, make them from the topic). Each section has 5 to 8 statements in simple English that respondents rate from Strongly Agree to Strongly Disagree. Statements are single ideas, not leading, with no numbering. The intro is two sentences that explain the purpose and that answers are confidential. The label is a short noun such as Gender, Age or Level of study.`, 'You design university survey questionnaires. Reply with JSON only.', { json: true })
+      let j: any; try { j = JSON.parse(t.slice(t.indexOf('{'), t.lastIndexOf('}') + 1)) } catch { j = null }
+      const okShape = j && Array.isArray(j.demographics) && Array.isArray(j.sections) && j.sections.length && j.sections.every((x: any) => Array.isArray(x.items) && x.items.length) && j.demographics.every((d: any) => d.question && Array.isArray(d.options) && d.options.length > 1)
+      if (!okShape) return res.status(502).json({ error: 'The questionnaire could not be created. Please try again.' })
+      await db.from('project_surveys').upsert({ project_id: projectId, questionnaire: j, data: null, results: null, updated_at: new Date().toISOString() })
+      return res.json({ ok: true, questionnaire: j })
+    }
+    if (action === 'write_results') {
+      const { data: sv } = await db.from('project_surveys').select('results,questionnaire').eq('project_id', projectId).single()
+      if (!sv?.results?.tables?.length) return res.status(400).json({ error: 'Upload your survey responses first.' })
+      const { data: sec } = await db.from('project_sections').select('*').eq('id', sectionId).eq('project_id', projectId).single()
+      if (!sec) return res.status(404).json({ error: 'Section not found' })
+      const R = sv.results
+      const allowed = new Set<number>([...(JSON.stringify(R).match(/\d+(\.\d+)?/g) || []).map(Number), 0, 1, 2, 3, 4, 5, 100])
+      const bad = (t: string) => [...new Set((t.match(/\d+(\.\d+)?/g) || []).map(Number))].filter(x => !allowed.has(x))
+      const prompt = `RESULTS (calculated by software from the students' real responses, n = ${R.n}):\n${JSON.stringify(R.tables)}\n\nOBJECTIVES: ${JSON.stringify((sv.questionnaire?.sections ?? []).map((x: any) => x.objective || x.title))}\n\nWrite the section "${sec.heading}" of Chapter Four as the analysis of these results, in simple English and in paragraphs. Refer to each table as Table 4.x and describe what it shows using only the figures given: counts, percentages, means, standard deviations and decisions. A mean of ${R.benchmark} or more is Agree. Do not repeat the tables. Do not use any number that is not in RESULTS. Do not invent causes, comparisons, sources or findings. About 600 to 900 words.`
+      let text = clean(await gemini(prompt, RULES)); let b = bad(text)
+      if (b.length) { text = clean(await gemini(prompt + `\nFIX: your last draft used numbers that are not in RESULTS (${b.join(', ')}). Rewrite without them.`, RULES)); b = bad(text) }
+      if (b.length) return res.status(422).json({ error: `The AI used numbers that are not in your data (${b.join(', ')}). Please try again.` })
+      await db.from('project_sections').update({ previous_content: sec.content, content: text, status: 'completed', user_edited: false, updated_at: new Date().toISOString() }).eq('id', sectionId)
+      await db.from('project_surveys').update({ section_id: sectionId }).eq('project_id', projectId)
+      return res.json({ ok: true })
+    }
+    if (action === 'make_questionnaire') {
+      const { data: mem } = await db.from('project_memory').select('data').eq('project_id', projectId).single()
+      const t = await gemini(`Project topic: ${project.topic}\nCourse: ${project.course_name}\nLevel: ${project.level}\nProject memory: ${JSON.stringify(mem?.data)}\n\nCreate a questionnaire for this final year project. Reply with ONLY this JSON shape:\n{"intro":"","demographics":[{"label":"Gender","question":"What is your gender?","options":["Male","Female"]}],"sections":[{"title":"","objective":"","items":["statement"]}]}\nRules: 4 to 6 demographic questions with closed options that suit this topic and its respondents. 3 to 5 sections, one for each research objective in the project memory (if there are none, make them from the topic). Each section has 5 to 8 statements in simple English that respondents rate from Strongly Agree to Strongly Disagree. Statements are single ideas, not leading, with no numbering. The intro is two sentences that explain the purpose and that answers are confidential. The label is a short noun such as Gender, Age or Level of study.`, 'You design university survey questionnaires. Reply with JSON only.', { json: true })
+      let j: any; try { j = JSON.parse(t.slice(t.indexOf('{'), t.lastIndexOf('}') + 1)) } catch { j = null }
+      const okShape = j && Array.isArray(j.demographics) && Array.isArray(j.sections) && j.sections.length && j.sections.every((x: any) => Array.isArray(x.items) && x.items.length) && j.demographics.every((d: any) => d.question && Array.isArray(d.options) && d.options.length > 1)
+      if (!okShape) return res.status(502).json({ error: 'The questionnaire could not be created. Please try again.' })
+      await db.from('project_surveys').upsert({ project_id: projectId, questionnaire: j, data: null, results: null, updated_at: new Date().toISOString() })
+      return res.json({ ok: true, questionnaire: j })
+    }
+    if (action === 'write_results') {
+      const { data: sv } = await db.from('project_surveys').select('results,questionnaire').eq('project_id', projectId).single()
+      if (!sv?.results?.tables?.length) return res.status(400).json({ error: 'Upload your survey responses first.' })
+      const { data: sec } = await db.from('project_sections').select('*').eq('id', sectionId).eq('project_id', projectId).single()
+      if (!sec) return res.status(404).json({ error: 'Section not found' })
+      const R = sv.results
+      const allowed = new Set<number>([...(JSON.stringify(R).match(/\d+(\.\d+)?/g) || []).map(Number), 0, 1, 2, 3, 4, 5, 100])
+      const bad = (t: string) => [...new Set((t.match(/\d+(\.\d+)?/g) || []).map(Number))].filter(x => !allowed.has(x))
+      const prompt = `RESULTS (calculated by software from the students' real responses, n = ${R.n}):\n${JSON.stringify(R.tables)}\n\nOBJECTIVES: ${JSON.stringify((sv.questionnaire?.sections ?? []).map((x: any) => x.objective || x.title))}\n\nWrite the section "${sec.heading}" of Chapter Four as the analysis of these results, in simple English and in paragraphs. Refer to each table as Table 4.x and describe what it shows using only the figures given: counts, percentages, means, standard deviations and decisions. A mean of ${R.benchmark} or more is Agree. Do not repeat the tables. Do not use any number that is not in RESULTS. Do not invent causes, comparisons, sources or findings. About 600 to 900 words.`
+      let text = clean(await gemini(prompt, RULES)); let b = bad(text)
+      if (b.length) { text = clean(await gemini(prompt + `\nFIX: your last draft used numbers that are not in RESULTS (${b.join(', ')}). Rewrite without them.`, RULES)); b = bad(text) }
+      if (b.length) return res.status(422).json({ error: `The AI used numbers that are not in your data (${b.join(', ')}). Please try again.` })
+      await db.from('project_sections').update({ previous_content: sec.content, content: text, status: 'completed', user_edited: false, updated_at: new Date().toISOString() }).eq('id', sectionId)
+      return res.json({ ok: true })
+    }
     if (action === 'correct_section') {
       const instruction = String(req.body?.instruction ?? '').slice(0, 4000)
       const { data: s } = await db.from('project_sections').select('*').eq('id', sectionId).eq('project_id', projectId).single()

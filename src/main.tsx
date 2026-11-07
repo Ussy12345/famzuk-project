@@ -10,6 +10,7 @@ import Dashboard from './pages/Dashboard'
 import NewProject from './pages/NewProject'
 import { Overview, Interview, Generate, Editor, Sources, Settings } from './pages/ProjectPages'
 import { Profile, Admin } from './pages/Account'
+import Survey from './pages/Survey'
 
 function Guard({ s, children }: { s: Session | null | undefined; children: React.ReactNode }) {
   if (s === undefined) return <p className="p-8">Loading…</p>
@@ -36,6 +37,7 @@ function App() {
       <Route path="/projects/:id/editor" element={<Guard s={s}><Editor /></Guard>} />
       <Route path="/projects/:id/sources" element={<Guard s={s}><Sources /></Guard>} />
       <Route path="/projects/:id/settings" element={<Guard s={s}><Settings /></Guard>} />
+      <Route path="/projects/:id/survey" element={<Guard s={s}><Survey /></Guard>} />
       <Route path="/profile" element={<Guard s={s}><Profile /></Guard>} />
       <Route path="/admin" element={<Guard s={s}><Admin /></Guard>} />
       <Route path="*" element={<p className="p-8">Page not found. <Link className="underline" to="/">Go home</Link></p>} />

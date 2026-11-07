@@ -26,14 +26,14 @@ async function toJpeg(file: File): Promise<{ data: string; mime: string }> {
   c.getContext('2d')!.drawImage(bmp, 0, 0, c.width, c.height)
   return { data: c.toDataURL('image/jpeg', 0.82).split(',')[1], mime: 'image/jpeg' }
 }
-function useProject() {
+export function useProject() {
   const { id } = useParams(); const [p, setP] = useState<Row | null>(null)
   const reload = () => supabase.from('projects').select('*').eq('id', id).single().then(({ data }) => setP(data))
   useEffect(() => { reload() }, [id]); return { id: id!, p, reload }
 }
-function Shell({ id, p, children, extra, wide }: { id: string; p: Row | null; children: ReactNode; extra?: (done: () => void) => ReactNode; wide?: boolean }) {
+export function Shell({ id, p, children, extra, wide }: { id: string; p: Row | null; children: ReactNode; extra?: (done: () => void) => ReactNode; wide?: boolean }) {
   const nav = useNavigate(); const [open, setOpen] = useState(false)
-  const links = [['', 'Overview'], ['generate', 'Generate'], ['editor', 'Editor'], ['sources', 'Sources'], ['settings', 'Settings']]
+  const links = [['', 'Overview'], ['generate', 'Generate'], ['survey', 'Survey'], ['editor', 'Editor'], ['sources', 'Sources'], ['settings', 'Settings']]
   const done = () => setOpen(false)
   useEffect(() => {
     if (!open) return
